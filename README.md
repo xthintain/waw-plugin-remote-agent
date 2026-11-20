@@ -39,6 +39,17 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 
 远端侧默认落在 `~/.waw/bin/waw-remote-agent`，用 `WAW_REMOTE_AGENT_REMOTE_PATH` 覆盖。
 
+## 两个半端的可安装性
+
+同一个文件被求值两次，可安装性和「装到哪」并不相同（冒烟实测，2026-11-20）：
+
+| 半端 | 能力 | 放进 `~/.waw/tui/plugins/` | 说明 |
+| --- | --- | --- | --- |
+| tui-host（Node） | `remote::*` 工具、远端 shell/fs、后台 job | ✅ 可用 | 只依赖 `node:*` 与同目录 `.mjs`，无 app 内组件 |
+| 桌面 webview | 侧栏目标列表、创建向导、SSH 设置节 | ⚠️ 需 app 内的 `../components/*`、`../agent/tui-host-api` | 只有跑在 `web-agent/desktop/agent-desktop` 的 Vite 图里才解析得到。生产包用 `scripts/install-extras.mjs` 装进 `<extras>/plugins` |
+
+因此 `./install.sh` 默认把文件复制到 drop-in 目录，**保证 TUI 侧工具可用**；桌面面板请跟 waw-desktop 一起构建/安装。
+
 ## 测试
 
 ```sh

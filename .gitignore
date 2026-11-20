@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+# 构建产物不入库
+native/*/dist/
+native/*/waw-remote-agent
+native/*/waw-remote-agent.exe

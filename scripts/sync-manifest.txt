@@ -1,0 +1,26 @@
+# plugin <desktop/agent-desktop/src/plugins 下的文件名>
+plugin remote-agent.plugin.mjs
+plugin remote-bridge.mjs
+plugin remote-exec.mjs
+plugin remote-rpc.mjs
+plugin remote-status.mjs
+plugin remote-rpc.test.ts
+plugin remote-status.test.ts
+# native <native/ 下的相对路径>
+native waw-remote-agent/go.mod
+native waw-remote-agent/go.sum
+native waw-remote-agent/main.go
+native waw-remote-agent/daemon.go
+native waw-remote-agent/jobs.go
+native waw-remote-agent/protocol.go
+native waw-remote-agent/http_transport.go
+native waw-remote-agent/proc_unix.go
+native waw-remote-agent/proc_windows.go
+native waw-remote-agent/protocol_test.go
+native waw-remote-agent/daemon_test.go
+native waw-remote-agent/jobs_test.go
+native waw-remote-agent/http_transport_test.go
+native waw-remote-agent/main_test.go
+native waw-remote-agent/e2e_daemon_test.go
+native waw-remote-agent/build.sh
+native waw-remote-agent/build.ps1

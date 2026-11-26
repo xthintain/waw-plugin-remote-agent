@@ -8,10 +8,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -266,49 +264,6 @@ func (d *daemon) killStrayWorkers() {
 	killStrayRemoteAgents(self)
 }
 
-// killStrayRemoteAgents：Linux 下扫描 /proc，杀掉同一 binary 的所有非 daemon 进程。
-// 其它平台找不到 /proc 时静默跳过（直接子进程已由 stopWorker 处理）。
-func killStrayRemoteAgents(self string) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		exe, err := os.Readlink("/proc/" + entry.Name() + "/exe")
-		if err != nil || exe != self {
-			continue
-		}
-		raw, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
-		if err != nil {
-			continue
-		}
-		isDaemon := false
-		for _, arg := range strings.Split(string(raw), "\x00") {
-			if arg == "--daemon" {
-				isDaemon = true
-				break
-			}
-		}
-		// 守护进程常驻负责唤醒；其余（worker / stdio / 遗留进程）都回收。
-		if isDaemon {
-			continue
-		}
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
-		_ = p.Signal(syscall.SIGTERM)
-		go func(p *os.Process) {
-			time.Sleep(2 * time.Second)
-			_ = p.Kill()
-		}(p)
-	}
-}
-
 func dialDaemonWS(wsURL, token, agentID, workspace string) (*websocket.Conn, error) {
 	u, err := url.Parse(wsURL)
 	if err != nil {
@@ -426,8 +381,8 @@ func (d *daemon) stopWorker() bool {
 	d.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
-		// 先 SIGTERM，随后 SIGKILL 兜底
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		// Unix/macOS 先 SIGTERM，Windows 直接 Kill，随后 SIGKILL 兜底
+		terminateProcess(cmd.Process)
 		go func(p *os.Process, done chan struct{}) {
 			if done != nil {
 				select {

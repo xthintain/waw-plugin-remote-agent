@@ -16,6 +16,11 @@ native waw-remote-agent/protocol.go
 native waw-remote-agent/http_transport.go
 native waw-remote-agent/proc_unix.go
 native waw-remote-agent/proc_windows.go
+native waw-remote-agent/stray_linux.go
+native waw-remote-agent/stray_darwin.go
+native waw-remote-agent/stray_other.go
+native waw-remote-agent/stray_ps.go
+native waw-remote-agent/stray_ps_test.go
 native waw-remote-agent/protocol_test.go
 native waw-remote-agent/daemon_test.go
 native waw-remote-agent/jobs_test.go

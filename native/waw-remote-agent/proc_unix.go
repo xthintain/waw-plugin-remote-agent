@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -28,6 +29,13 @@ func killProcessTree(cmd *exec.Cmd) {
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
 		_ = cmd.Process.Kill()
 	}
+}
+
+func terminateProcess(p *os.Process) {
+	if p == nil {
+		return
+	}
+	_ = p.Signal(syscall.SIGTERM)
 }
 
 func exitCodeOf(err error) int {

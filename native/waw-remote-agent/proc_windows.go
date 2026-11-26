@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 )
 
@@ -15,6 +16,14 @@ func killProcessTree(cmd *exec.Cmd) {
 		return
 	}
 	_ = cmd.Process.Kill()
+}
+
+func terminateProcess(p *os.Process) {
+	if p == nil {
+		return
+	}
+	// Windows does not support SIGTERM; kill immediately instead of waiting for fallback.
+	_ = p.Kill()
 }
 
 func exitCodeOf(err error) int {

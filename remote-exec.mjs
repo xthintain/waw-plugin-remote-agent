@@ -12,6 +12,7 @@ import { delimiter, join } from 'node:path'
 import {
   disconnectAllRemoteAgents,
   ensureRemoteTool,
+  isAbsoluteWorkspacePath,
   shQuote,
   withRemoteAgent,
 } from './remote-bridge.mjs'
@@ -38,7 +39,7 @@ export function activeWorkspace(sessionId) {
   if (!map || typeof map !== 'object') return null
   const key = String(sessionId ?? '').trim()
   const value = map[key === 'new' ? '' : key]
-  if (!value || value.kind !== 'remote' || !value.sshHost || !String(value.root).startsWith('/')) {
+  if (!value || value.kind !== 'remote' || !value.sshHost || !isAbsoluteWorkspacePath(value.root)) {
     return null
   }
   return value
@@ -49,7 +50,7 @@ export function resolveRemoteCwd(wsRoot, cwd) {
   const root = String(wsRoot || '/').replace(/\/+$/, '') || '/'
   if (cwd == null || cwd === '' || cwd === '.' || cwd === './') return root
   const raw = String(cwd)
-  if (raw.startsWith('/')) return raw.replace(/\/+$/, '') || '/'
+  if (isAbsoluteWorkspacePath(raw)) return raw.replace(/[\\/]+$/, '') || '/'
   const base = root === '/' ? '' : root
   return `${base}/${raw.replace(/^\.\//, '')}`.replace(/\/+$/, '') || '/'
 }

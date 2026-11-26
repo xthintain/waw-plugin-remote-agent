@@ -1,6 +1,6 @@
 # waw-plugin-remote-agent
 
-waw 的**远程工作区**插件：一条 SSH 目标 = 一个远端项目，shell / 文件读写 / glob / grep 都在那台机器上执行，外加后台 job。
+waw 的**远程工作区**插件：一条 SSH 目标 = 一个远端项目，shell / 文件读写 / glob / grep 都在那台机器上执行，外加后台 job。支持 **Linux、macOS（Intel / Apple Silicon）与 Windows**。
 
 同一个 `.plugin.mjs` 会被求值两次（这就是 waw 的插件契约）：
 
@@ -17,25 +17,50 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 | 文件 | 作用 |
 | --- | --- |
 | `remote-agent.plugin.mjs` | 插件入口，两端的分支都在这里 |
-| `remote-bridge.mjs` | 起 / 池化 `waw-remote-agent`，SSH 只用来投递并启动远端二进制 |
+| `remote-bridge.mjs` | 起 / 池化 `waw-remote-agent`，SSH 只用来探测目标平台、投递并启动远端二进制 |
 | `remote-exec.mjs` | 远端 shell / fs / code::map 的转发层 |
 | `remote-rpc.mjs` | 与远端二进制的 JSON-RPC 客户端 |
 | `remote-status.mjs` | 健康表（侧栏与重连用），被 `remote-rpc.test.ts` / `remote-status.test.ts` 覆盖 |
-| `native/waw-remote-agent/` | 远端 Go agent 源码（协议版本 5：daemon 生命周期 + 后台 job） |
+| `native/waw-remote-agent/` | 远端 Go agent 源码（协议版本 5：daemon 生命周期 + 后台 job，支持 Linux / macOS / Windows） |
+
+## 平台支持与构建
+
+支持宿主机与远端主机任意组合（Linux / macOS / Windows × `amd64` / `arm64`）：
+
+```sh
+# macOS / Linux：自动按当前宿主机 OS/arch 构建
+./install.sh --build
+
+# 一次交叉构建全平台二进制（推荐跨平台 SSH，如 macOS 连 Linux 远端）
+./install.sh --build-all
+# 或直接跑构建脚本：
+./native/waw-remote-agent/build.sh --all
+```
+
+Windows PowerShell：
+
+```powershell
+# 按当前 Windows 架构（amd64/arm64）构建
+.\native\waw-remote-agent\build.ps1
+
+# 一次交叉构建全平台二进制（含 linux / darwin / windows）
+.\native\waw-remote-agent\build.ps1 -All
+```
 
 ## 安装
 
 ```sh
-./install.sh            # 复制 .mjs 到 ~/.waw/tui/plugins/
-./install.sh --link     # 软链接，改代码后 reload 生效
-./install.sh --build    # 顺带 go build 出远端二进制
+./install.sh              # 复制 .mjs 到 ~/.waw/tui/plugins/
+./install.sh --link       # 软链接，改代码后 reload 生效
+./install.sh --build      # 顺带按当前平台 go build 出远端二进制
+./install.sh --build-all  # 顺带交叉构建全平台二进制
 ```
 
-插件加载成功但远端功能起不来，几乎总是二进制缺失。解析顺序见 `remote-bridge.mjs` 的 `localBinary()`：
+插件加载成功但远端功能起不来，几乎总是二进制缺失。解析顺序见 `remote-bridge.mjs` 的 `resolveLocalBinary()`（优先按目标 `<os>-<arch>` 匹配 `waw-remote-agent-<os>-<arch>[.exe]`，再回退通用名 `waw-remote-agent[.exe]`）：
 
 1. `$WAW_REMOTE_AGENT_BIN`
-2. 仓库内 `native/waw-remote-agent/dist/waw-remote-agent`
-3. `$WAW_EXTRAS_DIR/bin/` 或 `~/.local/share/waw/extras/bin/`（`scripts/install-extras.mjs` 装的位置）
+2. 仓库内 `native/waw-remote-agent/dist/`
+3. `$WAW_EXTRAS_DIR/bin/`、macOS `~/Library/Application Support/waw/extras/bin/`、Windows `%LOCALAPPDATA%\waw\extras\bin\` 或 `~/.local/share/waw/extras/bin/`
 
 远端侧默认落在 `~/.waw/bin/waw-remote-agent`，用 `WAW_REMOTE_AGENT_REMOTE_PATH` 覆盖。
 
@@ -53,7 +78,7 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 ## 测试
 
 ```sh
-pnpm test          # 或 npx vitest run —— 覆盖 remote-rpc / remote-status
+pnpm test          # 或 npx vitest run —— 覆盖 remote-rpc / remote-status / remote-bridge
 ./native/waw-remote-agent/build.sh && (cd native/waw-remote-agent && go test ./...)
 ```
 

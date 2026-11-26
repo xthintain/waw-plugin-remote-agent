@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/waw-remote-agent/go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Node tests
+        run: node --test test/
+
+      - name: Build native agent (Unix / macOS)
+        if: runner.os != 'Windows'
+        run: ./native/waw-remote-agent/build.sh
+
+      - name: Build native agent (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\native\waw-remote-agent\build.ps1
+
+      - name: Run Go vet and tests
+        working-directory: native/waw-remote-agent
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Run macOS real-machine smoke verification
+        if: runner.os == 'macOS'
+        run: ./scripts/verify-macos.sh

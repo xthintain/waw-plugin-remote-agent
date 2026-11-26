@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -233,6 +234,8 @@ func (a *agent) handle(req request) {
 		_ = a.writeResponse(response{ID: req.ID, OK: true, Result: map[string]interface{}{
 			"pong":            "ok",
 			"hostname":        host,
+			"os":              runtime.GOOS,
+			"arch":            runtime.GOARCH,
 			"workspace":       a.workspace,
 			"agentId":         a.agentID,
 			"roots":           a.roots,
@@ -566,10 +569,12 @@ func (a *agent) resolveInside(raw string) (string, error) {
 	return "", errors.New("path outside allowed roots")
 }
 
-// pickShell：远端不保证有 bash（Alpine 等精简镜像只有 sh）。
+// pickShell：优先 bash；macOS/精简镜像缺失 bash 时依次回退到 zsh、sh。
 func pickShell() string {
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash"
+	for _, candidate := range []string{"bash", "zsh"} {
+		if _, err := exec.LookPath(candidate); err == nil {
+			return candidate
+		}
 	}
 	return "sh"
 }

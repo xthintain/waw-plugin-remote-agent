@@ -33,7 +33,7 @@ export const REQUIRED_PROTOCOL_VERSION = 5
 /** @type {Map<string, { key: string, child: import('node:child_process').ChildProcess, rpc: RemoteRpcClient, workspace: string, sshHost: string }>} */
 const pool = new Map()
 
-/** @type {Map<string, { home: string, remoteBin: string }>} */
+/** @type {Map<string, { home: string, remoteBin: string, os: string, arch: string }>} */
 const hostCache = new Map()
 
 /** @type {Map<string, Promise<unknown>>} */
@@ -44,7 +44,60 @@ const toolCache = new Map()
 const toolInflight = new Map()
 
 const CM_DIR = join(homedir() || tmpdir(), '.waw', 'ssh-cm')
-const ASKPASS_PATH = join(CM_DIR, 'askpass.sh')
+
+/** Map uname -s / process.platform to Go GOOS values (linux | darwin | windows). */
+export function normalizeRemoteOs(raw) {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'darwin' || value === 'macos') return 'darwin'
+  if (value === 'linux') return 'linux'
+  if (
+    value === 'win32' ||
+    value === 'windows' ||
+    value.startsWith('mingw') ||
+    value.startsWith('msys') ||
+    value.startsWith('cygwin')
+  ) {
+    return 'windows'
+  }
+  return ''
+}
+
+/** Map uname -m / process.arch to Go GOARCH values (amd64 | arm64). */
+export function normalizeRemoteArch(raw) {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'arm64' || value === 'aarch64') return 'arm64'
+  if (value === 'x86_64' || value === 'amd64' || value === 'x64') return 'amd64'
+  return ''
+}
+
+/** Current host's Go OS/arch pair (for local pipe spawning and fallback). */
+export function hostTargetPlatform(platform = process.platform, arch = process.arch) {
+  return {
+    os: normalizeRemoteOs(platform) || 'linux',
+    arch: normalizeRemoteArch(arch) || 'amd64',
+  }
+}
+
+/** True for POSIX (/...) or Windows drive (C:\... / C:/...) absolute paths. */
+export function isAbsoluteWorkspacePath(raw) {
+  const value = String(raw ?? '').trim()
+  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)
+}
+
+/**
+ * Resolve the SSH ControlMaster socket directory.
+ * macOS caps sockaddr_un.sun_path at 104 bytes (and OpenSSH appends ~17 bytes
+ * during bind on top of the 40-char %C hash), so long home paths fail with
+ * "path too long for Unix domain socket". Fall back to a short /tmp dir there.
+ */
+export function resolveControlMasterDir(platform = process.platform, home = homedir()) {
+  const preferred = join(home || tmpdir(), '.waw', 'ssh-cm')
+  if (platform === 'darwin' && join(preferred, 'x'.repeat(40)).length > 84) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+    return `/tmp/waw-cm-${uid}`
+  }
+  return preferred
+}
 
 /** In-memory key passphrase (from desktop via tui-host). Never logged. */
 let sshPassphrase = ''
@@ -72,17 +125,23 @@ function remoteSh(script) {
   return `/bin/sh -c ${shQuote(script)}`
 }
 
-function ensureAskpassScript() {
+function ensureAskpassScript(platform = process.platform) {
   try {
     mkdirSync(CM_DIR, { recursive: true })
   } catch {
     /* */
   }
   // Prints WAW_SSH_ASKPASS_PASS — set only for the ssh/scp child env, not process-wide.
-  writeFileSync(ASKPASS_PATH, '#!/bin/sh\nprintf \'%s\\n\' "$WAW_SSH_ASKPASS_PASS"\n', {
+  if (platform === 'win32') {
+    const cmdPath = join(CM_DIR, 'askpass.cmd')
+    writeFileSync(cmdPath, '@echo off\r\necho %WAW_SSH_ASKPASS_PASS%\r\n', { mode: 0o700 })
+    return cmdPath
+  }
+  const shPath = join(CM_DIR, 'askpass.sh')
+  writeFileSync(shPath, '#!/bin/sh\nprintf \'%s\\n\' "$WAW_SSH_ASKPASS_PASS"\n', {
     mode: 0o700,
   })
-  return ASKPASS_PATH
+  return shPath
 }
 
 /** Env for ssh/scp: when passphrase is set, force askpass (BatchMode would ignore it). */
@@ -97,9 +156,14 @@ function sshChildEnv() {
   return env
 }
 
-function multiplexArgs() {
+export function multiplexArgs(platform = process.platform, home = homedir()) {
+  // Windows OpenSSH does not support Unix domain socket ControlMaster multiplexing.
+  if (platform === 'win32') {
+    return ['-o', 'ConnectTimeout=15']
+  }
+  const cmDir = resolveControlMasterDir(platform, home)
   try {
-    mkdirSync(CM_DIR, { recursive: true })
+    mkdirSync(cmDir, { recursive: true, mode: 0o700 })
   } catch {
     /* */
   }
@@ -109,7 +173,7 @@ function multiplexArgs() {
     '-o',
     'ControlMaster=auto',
     '-o',
-    `ControlPath=${CM_DIR}/%C`,
+    `ControlPath=${cmDir}/%C`,
     '-o',
     'ControlPersist=120',
   ]
@@ -157,29 +221,75 @@ function scpBaseArgs() {
  * This file is copied there too, so the checkout-relative candidates below do
  * not exist in an installed app.
  */
-function extrasDirs() {
-  const dataHome = process.env.XDG_DATA_HOME?.trim() || join(homedir(), '.local', 'share')
-  return [process.env.WAW_EXTRAS_DIR?.trim(), join(dataHome, 'waw', 'extras')].filter(Boolean)
+export function extrasDirs(
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+) {
+  const dirs = [env.WAW_EXTRAS_DIR?.trim()]
+  if (platform === 'darwin') {
+    dirs.push(join(home, 'Library', 'Application Support', 'waw', 'extras'))
+  } else if (platform === 'win32') {
+    if (env.LOCALAPPDATA?.trim()) dirs.push(join(env.LOCALAPPDATA.trim(), 'waw', 'extras'))
+    if (env.APPDATA?.trim()) dirs.push(join(env.APPDATA.trim(), 'waw', 'extras'))
+  }
+  const dataHome = env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share')
+  dirs.push(join(dataHome, 'waw', 'extras'))
+  return [...new Set(dirs.filter(Boolean))]
 }
 
-function localBinary() {
-  const env = process.env.WAW_REMOTE_AGENT_BIN?.trim()
-  if (env && existsSync(env)) return env
-  const exe = process.platform === 'win32' ? 'waw-remote-agent.exe' : 'waw-remote-agent'
-  const here = dirname(fileURLToPath(import.meta.url))
-  // plugins → agent-desktop → desktop → repo; then the installed extras copy
+/**
+ * Resolve the local waw-remote-agent binary for a target { os, arch }.
+ * Prefers target-qualified `waw-remote-agent-<os>-<arch>[.exe]` so macOS / Windows /
+ * Linux hosts can cross-bootstrap any remote OS/arch, then falls back to generic
+ * `waw-remote-agent[.exe]`.
+ */
+export function resolveLocalBinary(
+  target,
+  {
+    env = process.env,
+    platform = process.platform,
+    arch = process.arch,
+    home = homedir(),
+    cwd = process.cwd(),
+    here = dirname(fileURLToPath(import.meta.url)),
+    exists = existsSync,
+  } = {},
+) {
+  const configured = env.WAW_REMOTE_AGENT_BIN?.trim()
+  if (configured && exists(configured)) return configured
+
+  const fallbackTarget = hostTargetPlatform(platform, arch)
+  const targetOs = normalizeRemoteOs(target?.os) || fallbackTarget.os
+  const targetArch = normalizeRemoteArch(target?.arch) || fallbackTarget.arch
+  const ext = targetOs === 'windows' ? '.exe' : ''
+  const qualified = `waw-remote-agent-${targetOs}-${targetArch}${ext}`
+  const generic = `waw-remote-agent${ext}`
+
+  // Standalone repo root, monorepo (plugins → agent-desktop → desktop → repo),
+  // cwd candidates, and installed extras directories.
+  const searchDirs = [
+    resolve(here, 'native/waw-remote-agent/dist'),
+    resolve(here, '../../../../native/waw-remote-agent/dist'),
+    resolve(cwd, 'native/waw-remote-agent/dist'),
+    resolve(cwd, '../native/waw-remote-agent/dist'),
+    ...extrasDirs(platform, env, home).map((dir) => join(dir, 'bin')),
+  ]
+  const uniqueDirs = [...new Set(searchDirs)]
   const candidates = [
-    resolve(here, '../../../../native/waw-remote-agent/dist/waw-remote-agent'),
-    resolve(process.cwd(), 'native/waw-remote-agent/dist/waw-remote-agent'),
-    resolve(process.cwd(), '../native/waw-remote-agent/dist/waw-remote-agent'),
-    ...extrasDirs().map((dir) => join(dir, 'bin', exe)),
+    ...uniqueDirs.map((dir) => join(dir, qualified)),
+    ...uniqueDirs.map((dir) => join(dir, generic)),
   ]
   for (const path of candidates) {
-    if (existsSync(path)) return path
+    if (exists(path)) return path
   }
   throw new Error(
-    `waw-remote-agent binary missing (set WAW_REMOTE_AGENT_BIN or run scripts/install-extras.mjs). Tried: ${candidates.join(', ')}`,
+    `waw-remote-agent binary missing for ${targetOs}/${targetArch} (set WAW_REMOTE_AGENT_BIN or run ./native/waw-remote-agent/build.sh --all). Tried: ${candidates.join(', ')}`,
   )
+}
+
+function localBinary(target) {
+  return resolveLocalBinary(target)
 }
 
 function run(cmd, args, opts = {}) {
@@ -233,22 +343,25 @@ async function resolveHostInstall(sshHost) {
       ...sshBaseArgs(),
       sshHost,
       remoteSh(
-        `home=$(printf %s "$HOME"); bin=${binExpr}; if test -x "$bin"; then st=installed; else st=missing; fi; printf '%s${marker}%s\\n' "$home" "$st"`,
+        `home=$(printf %s "$HOME"); bin=${binExpr}; if test -x "$bin"; then st=installed; else st=missing; fi; os=$(uname -s 2>/dev/null || echo linux); arch=$(uname -m 2>/dev/null || echo x86_64); printf '%s${marker}%s${marker}%s${marker}%s\\n' "$home" "$st" "$os" "$arch"`,
       ),
     ])
   ).trim()
-  const idx = out.lastIndexOf(marker)
-  if (idx < 0) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
-  const home = out.slice(0, idx)
-  const installed = out.slice(idx + marker.length) === 'installed'
+  const lastLine = out.split('\n').pop() ?? ''
+  const parts = lastLine.split(marker)
+  if (parts.length < 2) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
+  const [home, status, rawOs = '', rawArch = ''] = parts
+  const installed = status === 'installed'
   if (!home.startsWith('/')) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
+  const os = normalizeRemoteOs(rawOs) || 'linux'
+  const arch = normalizeRemoteArch(rawArch) || 'amd64'
   const remoteBin = configured?.startsWith('/') ? configured : remoteAgentPath(home)
-  const info = { home, remoteBin, installed }
-  if (installed) hostCache.set(sshHost, { home, remoteBin })
+  const info = { home, remoteBin, installed, os, arch }
+  if (installed) hostCache.set(sshHost, { home, remoteBin, os, arch })
   return info
 }
 
-async function uploadRemoteBinary(sshHost, localBin, remoteBin, remoteHome) {
+async function uploadRemoteBinary(sshHost, localBin, remoteBin, remoteHome, remoteOs, remoteArch) {
   const remoteDir = remoteBin.replace(/\/[^/]+$/, '') || `${remoteHome}/.waw/bin`
   // Upload to a sibling then mv: Linux refuses to open() a running executable for
   // truncate (ETXTBSY). Rename replaces the path while the old inode keeps serving.
@@ -270,17 +383,23 @@ async function uploadRemoteBinary(sshHost, localBin, remoteBin, remoteHome) {
       `remote agent on ${sshHost} is unavailable (install/refresh failed; user command was not run). Retry once; do not diagnose upload tools or remote bin paths.`,
     )
   }
-  hostCache.set(sshHost, { home: remoteHome, remoteBin })
+  hostCache.set(sshHost, { home: remoteHome, remoteBin, os: remoteOs, arch: remoteArch })
   return remoteBin
 }
 
-async function ensureRemoteBinary(sshHost, localBin, { force = false } = {}) {
+async function ensureRemoteBinary(sshHost, { force = false } = {}) {
   const info = await resolveHostInstall(sshHost)
   if (!force && (info.installed || hostCache.has(sshHost))) {
-    hostCache.set(sshHost, { home: info.home, remoteBin: info.remoteBin })
+    hostCache.set(sshHost, {
+      home: info.home,
+      remoteBin: info.remoteBin,
+      os: info.os,
+      arch: info.arch,
+    })
     return info.remoteBin
   }
-  return uploadRemoteBinary(sshHost, localBin, info.remoteBin, info.home)
+  const localBin = localBinary({ os: info.os, arch: info.arch })
+  return uploadRemoteBinary(sshHost, localBin, info.remoteBin, info.home, info.os, info.arch)
 }
 
 /**
@@ -364,14 +483,14 @@ function poolKey(sshHost, workspace) {
 }
 
 async function spawnAgent(sshHost, workspace, token, { forceInstall = false } = {}) {
-  const localBin = localBinary()
   if (sshHost === 'local') {
+    const localBin = localBinary(hostTargetPlatform())
     return spawn(localBin, ['--workspace', workspace, '--token', token], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
   }
-  const remoteBin = await ensureRemoteBinary(sshHost, localBin, { force: forceInstall })
+  const remoteBin = await ensureRemoteBinary(sshHost, { force: forceInstall })
   const remoteCmd = `${shQuote(remoteBin)} --workspace ${shQuote(workspace)} --token ${shQuote(token)}`
   return spawn('ssh', [...sshBaseArgs(), sshHost, remoteSh(remoteCmd)], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -388,7 +507,7 @@ export async function ensureRemoteAgent(target, opts = {}) {
   const sshHost = String(target.sshHost || '').trim()
   const workspace = String(target.root || '').replace(/\/+$/, '') || '/'
   if (!sshHost) throw new Error('sshHost required')
-  if (!workspace.startsWith('/')) throw new Error('remote workspace must be absolute')
+  if (!isAbsoluteWorkspacePath(workspace)) throw new Error('remote workspace must be absolute')
 
   const key = poolKey(sshHost, workspace)
   const healthTarget = { sshHost, root: workspace }
@@ -474,7 +593,7 @@ export async function withRemoteAgent(target, fn) {
 export function warmRemoteAgent(target) {
   const sshHost = String(target?.sshHost || '').trim()
   const root = String(target?.root || '').replace(/\/+$/, '') || '/'
-  if (!sshHost || !root.startsWith('/')) return
+  if (!sshHost || !isAbsoluteWorkspacePath(root)) return
   const key = poolKey(sshHost, root)
   if (pool.has(key) || warmInflight.has(key)) return
   const job = ensureRemoteAgent({ sshHost, root })
@@ -500,7 +619,7 @@ const probeInflight = new Map()
 export async function probeRemoteAgent(target, { timeoutMs = 25_000 } = {}) {
   const sshHost = String(target?.sshHost ?? '').trim()
   const root = String(target?.root ?? '').replace(/\/+$/, '') || '/'
-  if (!sshHost || !root.startsWith('/')) {
+  if (!sshHost || !isAbsoluteWorkspacePath(root)) {
     return {
       sshHost,
       root,
@@ -596,7 +715,7 @@ export async function remoteHomeDir(sshHost) {
   const cached = hostCache.get(sshHost)
   if (cached?.home) return cached.home
   const info = await resolveHostInstall(sshHost)
-  if (info.installed) hostCache.set(sshHost, { home: info.home, remoteBin: info.remoteBin })
+  if (info.installed) hostCache.set(sshHost, { home: info.home, remoteBin: info.remoteBin, os: info.os, arch: info.arch })
   return info.home.replace(/\/+$/, '') || '/'
 }
 

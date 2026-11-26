@@ -62,7 +62,7 @@ HTTP 模式下 token 同时用作 hub 的 bearer（`WAW_TUI_REMOTE_HUB_TOKEN` �
 #### 生命周期（WAW 开关机语义）
 
 - **控制面未启动**：daemon 只做带退避的重连，**不派生 worker**（不会在 WAW 没开时唤醒远端 agent）。
-- **WAW 关闭 / 连接断开**：立即暂停 worker 的自动重启（避免对着不存在的控制面 500ms 空转），已有进程保留到 `--idle-stop` 宽限期（默认 `30m`）；到期后 daemon 停止所有 worker（Linux 下同时清扫同一 binary 的其它非 daemon 进程），**daemon 自身常驻**。
+- **WAW 关闭 / 连接断开**：立即暂停 worker 的自动重启（避免对着不存在的控制面 500ms 空转），已有进程保留到 `--idle-stop` 宽限期（默认 `30m`）；到期后 daemon 停止所有 worker（Linux 通过 `/proc`、macOS 通过 `ps` 同时清扫同一 binary 的其它非 daemon 进程），**daemon 自身常驻**。
 - **WAW 重新启动**：daemon 重连成功即取消回收并唤醒 worker。
 - 显式 `daemon_stop` 的停止意图跨重连保持；`daemon_start` / `daemon_restart` 才会重新拉起。
 - 回收宽限期可用 `--idle-stop 10m` 调整（默认 `30m`）。

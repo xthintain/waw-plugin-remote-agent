@@ -11,12 +11,36 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  AGENT_MODES,
+  DEFAULT_AGENT_MODE,
+  assertModeAllowsTarget,
+  getAgentMode,
+  isLocalTarget,
+  isTargetAllowedInMode,
+  normalizeAgentMode,
+  requiredModeForTarget,
+  setAgentModeRaw,
+  subscribeAgentMode,
+} from './remote-mode.mjs'
 import { RemoteRpcClient } from './remote-rpc.mjs'
 import {
   listRemoteAgentHealth,
   recordRemoteAgentHealth,
   subscribeRemoteAgentHealth,
 } from './remote-status.mjs'
+
+export {
+  AGENT_MODES,
+  DEFAULT_AGENT_MODE,
+  assertModeAllowsTarget,
+  getAgentMode,
+  isLocalTarget,
+  isTargetAllowedInMode,
+  normalizeAgentMode,
+  requiredModeForTarget,
+  subscribeAgentMode,
+}
 
 const REMOTE_BIN_REL =
   process.env.WAW_REMOTE_AGENT_REMOTE_PATH?.trim() || '.waw/bin/waw-remote-agent'
@@ -38,6 +62,45 @@ const hostCache = new Map()
 
 /** @type {Map<string, Promise<unknown>>} */
 const warmInflight = new Map()
+
+/** Serialize mode transitions so teardown and switch never race. */
+let modeSwitchInflight = Promise.resolve()
+
+/** Current isolated mode status and active pooled connection count. */
+export function getAgentModeStatus() {
+  return {
+    mode: getAgentMode(),
+    activeConnections: pool.size,
+    hosts: [...pool.values()].map((c) => c.sshHost),
+  }
+}
+
+/**
+ * Switch strictly between isolated `remote` and `local` agent modes.
+ * Tears down every active connection from the previous mode before activating
+ * the target mode so remote and local agents never run simultaneously.
+ */
+export async function switchAgentMode(nextMode) {
+  const normalized = normalizeAgentMode(nextMode)
+  if (!normalized) {
+    throw new Error(`invalid agent mode "${nextMode}": must be "remote" or "local"`)
+  }
+  const runSwitch = async () => {
+    const previousMode = getAgentMode()
+    if (previousMode === normalized) {
+      return { previousMode, mode: normalized, switched: false, disconnected: 0 }
+    }
+    const disconnected = pool.size
+    warmInflight.clear()
+    probeInflight.clear()
+    await disconnectAllRemoteAgents()
+    setAgentModeRaw(normalized)
+    return { previousMode, mode: normalized, switched: true, disconnected }
+  }
+  const job = modeSwitchInflight.then(runSwitch, runSwitch)
+  modeSwitchInflight = job.catch(() => undefined)
+  return job
+}
 
 /** Remote helper binaries (codemap, …) uploaded once per host. */
 const toolCache = new Map()
@@ -412,6 +475,7 @@ async function ensureRemoteBinary(sshHost, { force = false } = {}) {
 export async function ensureRemoteTool(sshHost, localPath, name) {
   const host = String(sshHost || '').trim()
   if (!host) throw new Error('sshHost required')
+  assertModeAllowsTarget(host)
   if (host === 'local') return localPath
   const key = `${host}\0${name}`
   const cached = toolCache.get(key)
@@ -508,6 +572,7 @@ export async function ensureRemoteAgent(target, opts = {}) {
   const workspace = String(target.root || '').replace(/\/+$/, '') || '/'
   if (!sshHost) throw new Error('sshHost required')
   if (!isAbsoluteWorkspacePath(workspace)) throw new Error('remote workspace must be absolute')
+  assertModeAllowsTarget(sshHost)
 
   const key = poolKey(sshHost, workspace)
   const healthTarget = { sshHost, root: workspace }
@@ -594,6 +659,7 @@ export function warmRemoteAgent(target) {
   const sshHost = String(target?.sshHost || '').trim()
   const root = String(target?.root || '').replace(/\/+$/, '') || '/'
   if (!sshHost || !isAbsoluteWorkspacePath(root)) return
+  if (!isTargetAllowedInMode(sshHost)) return
   const key = poolKey(sshHost, root)
   if (pool.has(key) || warmInflight.has(key)) return
   const job = ensureRemoteAgent({ sshHost, root })
@@ -625,6 +691,17 @@ export async function probeRemoteAgent(target, { timeoutMs = 25_000 } = {}) {
       root,
       state: 'error',
       error: 'remote workspace must be absolute',
+      at: Date.now(),
+    }
+  }
+  try {
+    assertModeAllowsTarget(sshHost)
+  } catch (err) {
+    return {
+      sshHost,
+      root,
+      state: 'error',
+      error: err instanceof Error ? err.message : String(err),
       at: Date.now(),
     }
   }
@@ -701,6 +778,7 @@ function joinRemote(base, name) {
 
 /** Reuse a live agent only if its workspace contains `path`; else open one at `/`. */
 async function agentForBrowse(sshHost, path) {
+  assertModeAllowsTarget(sshHost)
   for (const conn of pool.values()) {
     if (conn.sshHost !== sshHost) continue
     if (conn.child.killed || conn.child.exitCode != null) continue
@@ -712,6 +790,8 @@ async function agentForBrowse(sshHost, path) {
 
 /** Browse helpers: HOME via cache/SSH only — no agent spawn just for $HOME. */
 export async function remoteHomeDir(sshHost) {
+  assertModeAllowsTarget(sshHost)
+  if (sshHost === 'local') return homedir()
   const cached = hostCache.get(sshHost)
   if (cached?.home) return cached.home
   const info = await resolveHostInstall(sshHost)
@@ -741,8 +821,9 @@ function mapListEntries(remote, raw) {
 }
 
 export async function listRemoteDirectory(sshHost, path) {
+  assertModeAllowsTarget(sshHost)
   const remote = String(path || '/').replace(/\/+$/, '') || '/'
-  if (!remote.startsWith('/')) throw new Error('需要远端绝对路径')
+  if (!isAbsoluteWorkspacePath(remote)) throw new Error('需要远端绝对路径')
   let conn = await agentForBrowse(sshHost, remote)
   try {
     const resp = await conn.rpc.call('list_dir', { path: remote }, { timeoutMs: 30_000 })

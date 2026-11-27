@@ -18,10 +18,19 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 | --- | --- |
 | `remote-agent.plugin.mjs` | 插件入口，两端的分支都在这里 |
 | `remote-bridge.mjs` | 起 / 池化 `waw-remote-agent`，SSH 只用来探测目标平台、投递并启动远端二进制 |
-| `remote-exec.mjs` | 远端 shell / fs / code::map 的转发层 |
+| `remote-exec.mjs` | 远端 / 本地 shell / fs / code::map 的转发层 |
+| `remote-mode.mjs` | `remote` 与 `local` 模式的严格互斥隔离状态机 |
 | `remote-rpc.mjs` | 与远端二进制的 JSON-RPC 客户端 |
 | `remote-status.mjs` | 健康表（侧栏与重连用），被 `remote-rpc.test.ts` / `remote-status.test.ts` 覆盖 |
 | `native/waw-remote-agent/` | 远端 Go agent 源码（协议版本 5：daemon 生命周期 + 后台 job，支持 Linux / macOS / Windows） |
+
+
+## Remote / Local 模式隔离切换
+
+插件默认处于 `remote` 模式，可通过工具 `remote::mode` 或面板模式切换栏在 `remote`（SSH 远端执行）与 `local`（本地管道执行）之间显式切换：
+
+* **严格互斥隔离**：两种模式不能同时使用。处于 `remote` 模式时禁止调用 `local` 目标；处于 `local` 模式时禁止调用任何远端 SSH 目标。
+* **切换自动清理**：调用 `remote::mode`（`{"action": "switch", "mode": "local"}` 或 `"remote"`）或 `switchAgentMode()` 切换状态时，会先断开并回收旧模式的全部活跃连接，再激活目标模式。
 
 ## 平台支持与构建
 

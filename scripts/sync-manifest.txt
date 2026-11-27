@@ -2,6 +2,7 @@
 plugin remote-agent.plugin.mjs
 plugin remote-bridge.mjs
 plugin remote-exec.mjs
+plugin remote-mode.mjs
 plugin remote-rpc.mjs
 plugin remote-status.mjs
 plugin remote-rpc.test.ts

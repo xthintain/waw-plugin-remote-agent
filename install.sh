@@ -44,7 +44,7 @@ elif [ "$build" = 1 ]; then
 fi
 
 mkdir -p "$dest"
-for f in remote-agent.plugin.mjs remote-bridge.mjs remote-exec.mjs remote-rpc.mjs remote-status.mjs; do
+for f in remote-agent.plugin.mjs remote-bridge.mjs remote-exec.mjs remote-mode.mjs remote-rpc.mjs remote-status.mjs; do
   [ -f "$here/$f" ] || { echo "missing $f" >&2; exit 1; }
   if [ "$mode" = link ]; then ln -sfn "$here/$f" "$dest/$f"; else cp -f "$here/$f" "$dest/$f"; fi
 done

@@ -13,6 +13,17 @@
  * UI (settingsSection.render) — not a built-in Settings nav item.
  */
 
+import {
+  AGENT_MODES,
+  DEFAULT_AGENT_MODE,
+  assertModeAllowsTarget,
+  getAgentMode,
+  isTargetAllowedInMode,
+  normalizeAgentMode,
+  setAgentModeRaw,
+  subscribeAgentMode,
+} from './remote-mode.mjs'
+
 const COLORS = {
   accent: '#2F6FED',
   ink: '#1a1f2c',
@@ -27,8 +38,10 @@ const UI_ID = 'remote-agent.panel'
 const ACTION_ID = 'remote-agent.action'
 const CREATE_ID = 'remote-agent.create'
 const STORE_TARGETS = 'waw:plugin:remote-agent:targets'
+const STORE_MODE = 'waw:plugin:remote-agent:mode'
 const SETTINGS_ID = 'remote-agent'
 const DAEMON_ACTIONS = ['status', 'stop', 'start', 'restart']
+const MODE_ACTIONS = ['status', 'switch']
 
 const AUTH_KINDS = [
   { value: 'local', label: '本机管道' },
@@ -76,6 +89,30 @@ function saveTargets(rows) {
   try {
     if (typeof localStorage === 'undefined') return
     localStorage.setItem(STORE_TARGETS, JSON.stringify(rows))
+  } catch {
+    /* privacy mode */
+  }
+}
+
+function loadStoredMode() {
+  try {
+    if (typeof localStorage === 'undefined') return getAgentMode()
+    const raw = localStorage.getItem(STORE_MODE)
+    const normalized = normalizeAgentMode(raw)
+    if (normalized) {
+      setAgentModeRaw(normalized)
+      return normalized
+    }
+    return getAgentMode()
+  } catch {
+    return getAgentMode()
+  }
+}
+
+function saveStoredMode(mode) {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(STORE_MODE, mode)
   } catch {
     /* privacy mode */
   }
@@ -163,6 +200,8 @@ export default async function remoteAgent(api) {
 
   // ── Kernel half (tui-host) ────────────────────────────────────────────────
   if (caps.tools) {
+    const bridgeHref = new URL('./remote-bridge.mjs', import.meta.url).href
+    const { getAgentModeStatus, switchAgentMode } = await import(/* @vite-ignore */ bridgeHref)
     api.tools.register(
       {
         name: 'remote::ping',
@@ -176,9 +215,48 @@ export default async function remoteAgent(api) {
         JSON.stringify({
           ok: true,
           plugin: api.name,
+          mode: getAgentMode(),
           agentId: typeof args.agentId === 'string' ? args.agentId : null,
           at: new Date().toISOString(),
         }),
+    )
+    api.tools.register(
+      {
+        name: 'remote::mode',
+        description:
+          'Inspect or switch isolated execution mode between remote (SSH) and local (local pipe). The two modes are strictly isolated and cannot run simultaneously.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: MODE_ACTIONS },
+            mode: { type: 'string', enum: [...AGENT_MODES] },
+          },
+        },
+      },
+      async (args) => {
+        const action = String(args?.action ?? (args?.mode ? 'switch' : 'status')).trim()
+        if (!MODE_ACTIONS.includes(action)) {
+          throw new Error(`action must be ${MODE_ACTIONS.join('|')}`)
+        }
+        if (action === 'status') {
+          const status = getAgentModeStatus()
+          return JSON.stringify({
+            ok: true,
+            ...status,
+            isolatedFrom: status.mode === 'local' ? 'remote' : 'local',
+          })
+        }
+        const nextMode = normalizeAgentMode(args?.mode)
+        if (!nextMode) {
+          throw new Error(`mode must be ${AGENT_MODES.join('|')}`)
+        }
+        const result = await switchAgentMode(nextMode)
+        return JSON.stringify({
+          ok: true,
+          ...result,
+          isolatedFrom: result.mode === 'local' ? 'remote' : 'local',
+        })
+      },
     )
     api.tools.register(
       {
@@ -239,6 +317,7 @@ export default async function remoteAgent(api) {
 
   const { Box, Text, h, useState, useEffect } = api.ui
   let targets = loadTargets()
+  let activeMode = loadStoredMode()
   let lastDaemon = null
   const listeners = new Set()
   const notify = () => {
@@ -330,6 +409,18 @@ export default async function remoteAgent(api) {
       run: () => remountPanel(),
     })
     api.command({
+      id: 'remote-agent.switch-mode',
+      label: 'Remote Agent：切换 Remote / Local 隔离模式',
+      group: '插件',
+      run: () => {
+        const next = activeMode === 'local' ? 'remote' : 'local'
+        setAgentModeRaw(next)
+        activeMode = next
+        saveStoredMode(next)
+        notify()
+      },
+    })
+    api.command({
       id: 'remote-agent.clear-targets',
       label: 'Remote Agent：清空目标',
       group: '插件',
@@ -389,9 +480,12 @@ export default async function remoteAgent(api) {
   function Panel({ ctx }) {
     const [, tick] = useState(0)
     const [name, setName] = useState('本机远端')
+    const [mode, setMode] = useState(() => activeMode)
     const [authKind, setAuthKind] = useState(() => {
+      if (activeMode === 'local') return 'local'
       const s = readPluginSettings()
-      return typeof s.defaultAuth === 'string' ? s.defaultAuth : 'sshConfig'
+      const candidate = typeof s.defaultAuth === 'string' ? s.defaultAuth : 'sshConfig'
+      return candidate === 'local' ? 'sshConfig' : candidate
     })
     const [agentId, setAgentId] = useState('pod-a')
     const [host, setHost] = useState('')
@@ -412,11 +506,37 @@ export default async function remoteAgent(api) {
     const [browsing, setBrowsing] = useState(false)
 
     useEffect(() => {
-      const fn = () => tick((n) => n + 1)
+      const fn = () => {
+        setMode(activeMode)
+        tick((n) => n + 1)
+      }
       listeners.add(fn)
+      const unsubMode = subscribeAgentMode((ev) => {
+        activeMode = ev.mode
+        setMode(ev.mode)
+        setAuthKind((prev) => {
+          if (ev.mode === 'local') return 'local'
+          return prev === 'local' ? 'sshConfig' : prev
+        })
+      })
       applySettingsSideEffects()
-      return () => listeners.delete(fn)
+      return () => {
+        listeners.delete(fn)
+        unsubMode()
+      }
     }, [])
+
+    function switchUiMode(nextMode) {
+      const normalized = normalizeAgentMode(nextMode)
+      if (!normalized || normalized === mode) return
+      setAgentModeRaw(normalized)
+      activeMode = normalized
+      saveStoredMode(normalized)
+      setMode(normalized)
+      setAuthKind(normalized === 'local' ? 'local' : 'sshConfig')
+      setErr(null)
+      notify()
+    }
 
     const settings = readPluginSettings()
     const mockOnline = settings.mockOnline !== false
@@ -425,6 +545,12 @@ export default async function remoteAgent(api) {
 
     async function browseWorkspace() {
       setErr(null)
+      try {
+        assertModeAllowsTarget({ authKind }, mode)
+      } catch (e) {
+        setErr(e instanceof Error ? e.message : String(e))
+        return
+      }
       if (authKind === 'local' || authKind === 'sshConfig') {
         if (authKind === 'sshConfig' && !host.trim()) {
           setErr('请先填写 SSH config 里的 Host 名，再浏览那台机器上的目录')
@@ -459,6 +585,12 @@ export default async function remoteAgent(api) {
       setBusy(true)
       setErr(null)
       try {
+        try {
+          assertModeAllowsTarget({ authKind }, mode)
+        } catch (e) {
+          setErr(e instanceof Error ? e.message : String(e))
+          return
+        }
         if (authKind === 'agentWs' && !agentId.trim()) {
           setErr('agentWs 需要 agentId（与远端 --agent-id 一致，例如 pod-a）')
           return
@@ -512,6 +644,12 @@ export default async function remoteAgent(api) {
     }
 
     function mockDaemon(row, action) {
+      try {
+        assertModeAllowsTarget(row, mode)
+      } catch (e) {
+        setErr(e instanceof Error ? e.message : String(e))
+        return
+      }
       lastDaemon = {
         at: new Date().toISOString(),
         agentId: row.agentId || row.id,
@@ -640,6 +778,25 @@ export default async function remoteAgent(api) {
         `ui=${caps.ui} extras=${caps.extras} tools=${caps.tools} modules=${caps.modules}`,
       ),
 
+      h(
+        Box,
+        { marginTop: 10 },
+        h(Text, { color: COLORS.ink, bold: true }, `运行模式（互斥隔离）：${mode === 'local' ? 'Local Agent' : 'Remote Agent'}`),
+        h(
+          Box,
+          { flexDirection: 'row', marginTop: 4 },
+          btn('Remote 模式', () => switchUiMode('remote'), { primary: mode === 'remote' }),
+          btn('Local 模式', () => switchUiMode('local'), { primary: mode === 'local' }),
+        ),
+        h(
+          Text,
+          { color: COLORS.dim },
+          mode === 'local'
+            ? '当前仅允许本地执行（本机管道），远端 SSH 目标已隔离。'
+            : '当前仅允许远端目标（SSH / WS），本地执行已隔离。',
+        ),
+      ),
+
       h(Box, { marginTop: 12 }, h(Text, { color: COLORS.ink, bold: true }, '新建目标')),
       field('名称', input(name, setName, '本机远端')),
       field(
@@ -647,7 +804,7 @@ export default async function remoteAgent(api) {
         ThemeSelect
           ? h(ThemeSelect, {
               value: authKind,
-              options: AUTH_KINDS,
+              options: AUTH_KINDS.filter((k) => isTargetAllowedInMode({ authKind: k.value }, mode)),
               ariaLabel: '鉴权方式',
               onChange: setAuthKind,
             })
@@ -736,8 +893,9 @@ export default async function remoteAgent(api) {
         h(Text, { color: COLORS.ink, bold: true }, `目标 (${targets.length})`),
       ),
       targets.length === 0 ? h(Text, { color: COLORS.dim }, '还没有目标') : null,
-      ...targets.map((row) =>
-        h(
+      ...targets.map((row) => {
+        const allowed = isTargetAllowedInMode(row, mode)
+        return h(
           Box,
           {
             key: row.id,
@@ -745,25 +903,27 @@ export default async function remoteAgent(api) {
             padding: 8,
             border: `1px solid ${COLORS.line}`,
             borderRadius: 6,
-            background: '#fff',
+            background: allowed ? '#fff' : COLORS.soft,
           },
           h(Text, { bold: true, color: COLORS.ink }, row.name),
           h(Text, { color: COLORS.dim }, `${row.authKind} · ${row.remoteWorkspaceRoot}`),
           h(
             Text,
-            { color: row.status === 'online' ? COLORS.ok : COLORS.dim },
-            `status: ${row.status}${row.agentId ? ` · id ${row.agentId}` : ''}`,
+            { color: !allowed ? COLORS.warn : row.status === 'online' ? COLORS.ok : COLORS.dim },
+            !allowed
+              ? `已隔离 · 需切换至 ${row.authKind === 'local' ? 'Local' : 'Remote'} 模式`
+              : `status: ${row.status}${row.agentId ? ` · id ${row.agentId}` : ''}`,
           ),
           h(
             Box,
             { flexDirection: 'row', marginTop: 4 },
             ...DAEMON_ACTIONS.map((action) =>
-              btn(action, () => mockDaemon(row, action), { disabled: busy }),
+              btn(action, () => mockDaemon(row, action), { disabled: busy || !allowed }),
             ),
             btn('删除', () => removeTarget(row.id), { danger: true }),
           ),
-        ),
-      ),
+        )
+      }),
       lastDaemon
         ? h(
             Box,

@@ -10,6 +10,7 @@
 import { existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import {
+  assertModeAllowsTarget,
   disconnectAllRemoteAgents,
   ensureRemoteTool,
   isAbsoluteWorkspacePath,
@@ -34,15 +35,24 @@ function sanitizeRemoteError(msg) {
  * a remote run's binding mid-turn. The host now files bindings per session (see
  * tui/src/agent/session-workspace.ts), and the tool call carries the session.
  */
+export function normalizeWorkspaceTarget(value) {
+  if (!value || typeof value !== 'object') return null
+  if (!isAbsoluteWorkspacePath(value.root)) return null
+  if (value.kind === 'local') {
+    return { ...value, sshHost: 'local' }
+  }
+  if (value.kind === 'remote' && String(value.sshHost || '').trim()) {
+    return value
+  }
+  return null
+}
+
 export function activeWorkspace(sessionId) {
   const map = globalThis.__wawSessionWorkspaces
   if (!map || typeof map !== 'object') return null
   const key = String(sessionId ?? '').trim()
   const value = map[key === 'new' ? '' : key]
-  if (!value || value.kind !== 'remote' || !value.sshHost || !isAbsoluteWorkspacePath(value.root)) {
-    return null
-  }
-  return value
+  return normalizeWorkspaceTarget(value)
 }
 
 /** Map model cwd (often "." / relative) onto the remote workspace root. */
@@ -249,7 +259,8 @@ async function remoteCode(ws, call) {
 export function createRemoteProvider() {
   return {
     bind(ws) {
-      return primitivesFor(ws)
+      const normalized = normalizeWorkspaceTarget(ws) ?? ws
+      return primitivesFor(normalized)
     },
     extras: {
       names: ['code::map', 'code::syntax'],
@@ -257,7 +268,15 @@ export function createRemoteProvider() {
         const ws = activeWorkspace(ctx.sessionId)
         if (!ws) {
           return {
-            content: [{ type: 'text', text: '当前会话没有绑定远程工作区' }],
+            content: [{ type: 'text', text: '当前会话没有绑定工作区' }],
+            isError: true,
+          }
+        }
+        try {
+          assertModeAllowsTarget(ws)
+        } catch (err) {
+          return {
+            content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
             isError: true,
           }
         }

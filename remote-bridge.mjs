@@ -6,11 +6,30 @@
  * method "exec" / "read_file" / ….
  */
 import { spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  PS_PRELUDE,
+  browseRoot,
+  isAbsoluteRemoteRoot,
+  joinRemotePath,
+  normalizeArch,
+  normalizeDrives,
+  normalizeRemoteRoot,
+  parsePosixProbe,
+  parseWindowsProbe,
+  powershellCommand,
+  psMkdir,
+  psPath,
+  psQuote,
+  psScript,
+  remoteBinName,
+  remotePathInside,
+  sameRemotePath,
+} from './remote-os.mjs'
 import { RemoteRpcClient } from './remote-rpc.mjs'
 import {
   listRemoteAgentHealth,
@@ -27,68 +46,52 @@ const REMOTE_BIN_REL =
  * reclaim) — bumping also refreshes the binary that hosts the daemon.
  * 5: background jobs (`job_*`) + capability list in `ping`; `mkdir`/`move`
  * removed in favour of `exec`.
+ *
+ * 6 adds the PowerShell shell on Windows and `os`/`shell`/`capabilities` in
+ * `ping`. Only a Windows host needs 6: a POSIX remote keeps working on 5, so
+ * this does not force a reinstall of every Linux agent.
  */
-export const REQUIRED_PROTOCOL_VERSION = 5
+export const REQUIRED_PROTOCOL_VERSION = 6
+export const POSIX_PROTOCOL_VERSION = 5
 
 /** @type {Map<string, { key: string, child: import('node:child_process').ChildProcess, rpc: RemoteRpcClient, workspace: string, sshHost: string }>} */
 const pool = new Map()
 
-/** @type {Map<string, { home: string, remoteBin: string, os: string, arch: string }>} */
+/**
+ * `drives` lists the mounted drive roots on a Windows host (`C:/`, `D:/`), so the
+ * worker can be spawned with every drive allowed and the browser can offer them
+ * as top-level entries. POSIX hosts leave it empty.
+ *
+ * @type {Map<string, { home: string, remoteBin: string, os: 'posix'|'windows', osName: string, arch: string, psExe?: string, installed: boolean, drives: string[] }>} */
 const hostCache = new Map()
 
 /** @type {Map<string, Promise<unknown>>} */
 const warmInflight = new Map()
 
+/**
+ * Opening one (host, workspace) is a shared promise.
+ *
+ * The bind warms the agent and the first run may ask for the same target a
+ * moment later (shell capabilities, or its first tool); without this, both
+ * started an SSH worker and one was left orphaned in the pool.
+ *
+ * @type {Map<string, Promise<unknown>>}
+ */
+const ensureInflight = new Map()
+
 /** Remote helper binaries (codemap, …) uploaded once per host. */
 const toolCache = new Map()
 const toolInflight = new Map()
 
-const CM_DIR = join(homedir() || tmpdir(), '.waw', 'ssh-cm')
-
-/** Map uname -s / process.platform to Go GOOS values (linux | darwin | windows). */
-export function normalizeRemoteOs(raw) {
-  const value = String(raw ?? '').trim().toLowerCase()
-  if (value === 'darwin' || value === 'macos') return 'darwin'
-  if (value === 'linux') return 'linux'
-  if (
-    value === 'win32' ||
-    value === 'windows' ||
-    value.startsWith('mingw') ||
-    value.startsWith('msys') ||
-    value.startsWith('cygwin')
-  ) {
-    return 'windows'
-  }
-  return ''
-}
-
-/** Map uname -m / process.arch to Go GOARCH values (amd64 | arm64). */
-export function normalizeRemoteArch(raw) {
-  const value = String(raw ?? '').trim().toLowerCase()
-  if (value === 'arm64' || value === 'aarch64') return 'arm64'
-  if (value === 'x86_64' || value === 'amd64' || value === 'x64') return 'amd64'
-  return ''
-}
-
-/** Current host's Go OS/arch pair (for local pipe spawning and fallback). */
-export function hostTargetPlatform(platform = process.platform, arch = process.arch) {
-  return {
-    os: normalizeRemoteOs(platform) || 'linux',
-    arch: normalizeRemoteArch(arch) || 'amd64',
-  }
-}
-
-/** True for POSIX (/...) or Windows drive (C:\... / C:/...) absolute paths. */
-export function isAbsoluteWorkspacePath(raw) {
-  const value = String(raw ?? '').trim()
-  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)
-}
-
 /**
- * Resolve the SSH ControlMaster socket directory.
- * macOS caps sockaddr_un.sun_path at 104 bytes (and OpenSSH appends ~17 bytes
- * during bind on top of the 40-char %C hash), so long home paths fail with
- * "path too long for Unix domain socket". Fall back to a short /tmp dir there.
+ * Where the SSH ControlMaster sockets live.
+ *
+ * macOS caps `sockaddr_un.sun_path` at 104 bytes, and OpenSSH adds its own
+ * suffix when binding on top of the 40-character `%C` hash — a long home
+ * directory pushes `~/.waw/ssh-cm/<hash>` past that and every ssh call fails
+ * with "path too long for Unix domain socket". Fall back to a short /tmp path
+ * there (the uid keeps two accounts on one machine apart). Linux has no such
+ * limit; Windows never asks for a control socket at all.
  */
 export function resolveControlMasterDir(platform = process.platform, home = homedir()) {
   const preferred = join(home || tmpdir(), '.waw', 'ssh-cm')
@@ -125,19 +128,22 @@ function remoteSh(script) {
   return `/bin/sh -c ${shQuote(script)}`
 }
 
-function ensureAskpassScript(platform = process.platform) {
+function ensureAskpassScript(platform = process.platform, home = homedir()) {
+  const dir = resolveControlMasterDir(platform, home)
   try {
-    mkdirSync(CM_DIR, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
   } catch {
     /* */
   }
   // Prints WAW_SSH_ASKPASS_PASS — set only for the ssh/scp child env, not process-wide.
+  // Windows' OpenSSH never runs a `#!/bin/sh` script: it needs a .cmd (or an
+  // executable) to read the passphrase back.
   if (platform === 'win32') {
-    const cmdPath = join(CM_DIR, 'askpass.cmd')
+    const cmdPath = join(dir, 'askpass.cmd')
     writeFileSync(cmdPath, '@echo off\r\necho %WAW_SSH_ASKPASS_PASS%\r\n', { mode: 0o700 })
     return cmdPath
   }
-  const shPath = join(CM_DIR, 'askpass.sh')
+  const shPath = join(dir, 'askpass.sh')
   writeFileSync(shPath, '#!/bin/sh\nprintf \'%s\\n\' "$WAW_SSH_ASKPASS_PASS"\n', {
     mode: 0o700,
   })
@@ -156,11 +162,14 @@ function sshChildEnv() {
   return env
 }
 
+/**
+ * Multiplex SSH so probe + spawn share one TCP handshake (comfort: cold path).
+ *
+ * Windows' OpenSSH has no Unix-domain control sockets; asking for one only earns
+ * a warning on every call, so the plain connect timeout is the whole list there.
+ */
 export function multiplexArgs(platform = process.platform, home = homedir()) {
-  // Windows OpenSSH does not support Unix domain socket ControlMaster multiplexing.
-  if (platform === 'win32') {
-    return ['-o', 'ConnectTimeout=15']
-  }
+  if (platform === 'win32') return ['-o', 'ConnectTimeout=15']
   const cmDir = resolveControlMasterDir(platform, home)
   try {
     mkdirSync(cmDir, { recursive: true, mode: 0o700 })
@@ -221,75 +230,85 @@ function scpBaseArgs() {
  * This file is copied there too, so the checkout-relative candidates below do
  * not exist in an installed app.
  */
-export function extrasDirs(
-  platform = process.platform,
-  env = process.env,
-  home = homedir(),
-) {
-  const dirs = [env.WAW_EXTRAS_DIR?.trim()]
-  if (platform === 'darwin') {
-    dirs.push(join(home, 'Library', 'Application Support', 'waw', 'extras'))
-  } else if (platform === 'win32') {
-    if (env.LOCALAPPDATA?.trim()) dirs.push(join(env.LOCALAPPDATA.trim(), 'waw', 'extras'))
-    if (env.APPDATA?.trim()) dirs.push(join(env.APPDATA.trim(), 'waw', 'extras'))
+function extrasDirs() {
+  const dataHome = process.env.XDG_DATA_HOME?.trim() || join(homedir(), '.local', 'share')
+  return [process.env.WAW_EXTRAS_DIR?.trim(), join(dataHome, 'waw', 'extras')].filter(Boolean)
+}
+
+function sha8(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 8)
+}
+
+/** Node's own platform/arch, spelled the way Go's GOOS/GOARCH are. */
+const NODE_OS = { linux: 'linux', darwin: 'darwin', win32: 'windows' }
+const NODE_ARCH = { x64: 'amd64', arm64: 'arm64', ia32: '386', arm: 'arm' }
+const localTarget = { osName: NODE_OS[process.platform] ?? process.platform, arch: NODE_ARCH[process.arch] ?? process.arch }
+
+/**
+ * Candidate file names for a remote target, most specific first.
+ *
+ * Extracted from `localBinary` so the name choice is testable without touching
+ * the disk: dropping the arch from a name silently uploads a binary the host
+ * cannot execute, and that is the kind of mistake a test has to catch.
+ *
+ * `local` describes this desktop's own build (the unversioned `waw-remote-agent`
+ * file is only ever that build; it is never offered to a different target).
+ */
+function targetOf(os, info = {}, local = localTarget) {
+  return {
+    arch: normalizeArch(info.arch) || local.arch,
+    osName: os === 'windows' ? 'windows' : info.osName || local.osName,
   }
-  const dataHome = env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share')
-  dirs.push(join(dataHome, 'waw', 'extras'))
-  return [...new Set(dirs.filter(Boolean))]
+}
+
+export function binaryNamesFor(os = 'posix', info = {}, local = localTarget) {
+  const { arch, osName } = targetOf(os, info, local)
+  const names = []
+  if (os === 'windows') {
+    names.push(`waw-remote-agent-windows-${arch}.exe`)
+    // A Windows desktop's own unversioned build is amd64; never hand it to an
+    // arm64 host.
+    if (arch === 'amd64') names.push('waw-remote-agent.exe')
+  } else {
+    names.push(`waw-remote-agent-${osName}-${arch}`)
+    if (osName === local.osName && arch === local.arch) names.push('waw-remote-agent')
+  }
+  return [...new Set(names)]
 }
 
 /**
- * Resolve the local waw-remote-agent binary for a target { os, arch }.
- * Prefers target-qualified `waw-remote-agent-<os>-<arch>[.exe]` so macOS / Windows /
- * Linux hosts can cross-bootstrap any remote OS/arch, then falls back to generic
- * `waw-remote-agent[.exe]`.
+ * The local binary to upload for a remote of `os` — NOT the host's own binary.
+ *
+ * The target comes from what the probe found (`info.osName` / `info.arch`), so a
+ * Windows arm64 laptop gets the arm64 `.exe` and nothing is assumed to be amd64.
+ * `WAW_REMOTE_AGENT_BIN` overrides POSIX, `WAW_REMOTE_AGENT_WIN_BIN` Windows.
  */
-export function resolveLocalBinary(
-  target,
-  {
-    env = process.env,
-    platform = process.platform,
-    arch = process.arch,
-    home = homedir(),
-    cwd = process.cwd(),
-    here = dirname(fileURLToPath(import.meta.url)),
-    exists = existsSync,
-  } = {},
-) {
-  const configured = env.WAW_REMOTE_AGENT_BIN?.trim()
-  if (configured && exists(configured)) return configured
-
-  const fallbackTarget = hostTargetPlatform(platform, arch)
-  const targetOs = normalizeRemoteOs(target?.os) || fallbackTarget.os
-  const targetArch = normalizeRemoteArch(target?.arch) || fallbackTarget.arch
-  const ext = targetOs === 'windows' ? '.exe' : ''
-  const qualified = `waw-remote-agent-${targetOs}-${targetArch}${ext}`
-  const generic = `waw-remote-agent${ext}`
-
-  // Standalone repo root, monorepo (plugins → agent-desktop → desktop → repo),
-  // cwd candidates, and installed extras directories.
-  const searchDirs = [
-    resolve(here, 'native/waw-remote-agent/dist'),
-    resolve(here, '../../../../native/waw-remote-agent/dist'),
-    resolve(cwd, 'native/waw-remote-agent/dist'),
-    resolve(cwd, '../native/waw-remote-agent/dist'),
-    ...extrasDirs(platform, env, home).map((dir) => join(dir, 'bin')),
+function localBinary(os = 'posix', info = {}) {
+  const override =
+    os === 'windows'
+      ? process.env.WAW_REMOTE_AGENT_WIN_BIN?.trim()
+      : process.env.WAW_REMOTE_AGENT_BIN?.trim()
+  if (override && existsSync(override)) return override
+  const { osName, arch } = targetOf(os, info)
+  const names = binaryNamesFor(os, info)
+  const here = dirname(fileURLToPath(import.meta.url))
+  const dist = (name) => [
+    resolve(here, `../../../../native/waw-remote-agent/dist/${name}`),
+    resolve(process.cwd(), `native/waw-remote-agent/dist/${name}`),
+    resolve(process.cwd(), `../native/waw-remote-agent/dist/${name}`),
   ]
-  const uniqueDirs = [...new Set(searchDirs)]
   const candidates = [
-    ...uniqueDirs.map((dir) => join(dir, qualified)),
-    ...uniqueDirs.map((dir) => join(dir, generic)),
+    ...names.flatMap((name) => dist(name)),
+    ...extrasDirs().flatMap((dir) => names.map((name) => join(dir, 'bin', name))),
   ]
   for (const path of candidates) {
-    if (exists(path)) return path
+    if (existsSync(path)) return path
   }
   throw new Error(
-    `waw-remote-agent binary missing for ${targetOs}/${targetArch} (set WAW_REMOTE_AGENT_BIN or run ./native/waw-remote-agent/build.sh --all). Tried: ${candidates.join(', ')}`,
+    `waw-remote-agent binary for ${osName}/${arch} missing (set ${
+      os === 'windows' ? 'WAW_REMOTE_AGENT_WIN_BIN' : 'WAW_REMOTE_AGENT_BIN'
+    } or build it with WAW_REMOTE_TARGETS=${osName}/${arch}). Tried: ${candidates.join(', ')}`,
   )
-}
-
-function localBinary(target) {
-  return resolveLocalBinary(target)
 }
 
 function run(cmd, args, opts = {}) {
@@ -326,13 +345,11 @@ function remoteAgentPath(home) {
 }
 
 /**
- * One SSH round-trip: resolve HOME + whether the agent binary is already installed.
- * Cached per host for the process lifetime.
+ * POSIX probe: HOME, whether the fixed-name agent is executable, and the remote
+ * OS/arch so the upload can pick a matching build instead of assuming this
+ * desktop's own.
  */
-async function resolveHostInstall(sshHost) {
-  const cached = hostCache.get(sshHost)
-  if (cached) return { ...cached, installed: true }
-
+async function probePosixHost(sshHost) {
   const marker = '__WAW__'
   const configured = process.env.WAW_REMOTE_AGENT_REMOTE_PATH?.trim()
   const binExpr = configured?.startsWith('/')
@@ -343,25 +360,145 @@ async function resolveHostInstall(sshHost) {
       ...sshBaseArgs(),
       sshHost,
       remoteSh(
-        `home=$(printf %s "$HOME"); bin=${binExpr}; if test -x "$bin"; then st=installed; else st=missing; fi; os=$(uname -s 2>/dev/null || echo linux); arch=$(uname -m 2>/dev/null || echo x86_64); printf '%s${marker}%s${marker}%s${marker}%s\\n' "$home" "$st" "$os" "$arch"`,
+        `home=$(printf %s "$HOME"); bin=${binExpr}; if test -x "$bin"; then st=installed; else st=missing; fi;` +
+          ` printf '%s${marker}%s${marker}%s${marker}%s\\n' "$home" "$st" "$(uname -s)" "$(uname -m)"`,
       ),
     ])
   ).trim()
-  const lastLine = out.split('\n').pop() ?? ''
-  const parts = lastLine.split(marker)
-  if (parts.length < 2) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
-  const [home, status, rawOs = '', rawArch = ''] = parts
-  const installed = status === 'installed'
-  if (!home.startsWith('/')) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
-  const os = normalizeRemoteOs(rawOs) || 'linux'
-  const arch = normalizeRemoteArch(rawArch) || 'amd64'
+  const parsed = parsePosixProbe(out)
+  if (!parsed) throw new Error(`cannot resolve remote HOME on ${sshHost}`)
+  const { home, installed, osName, arch } = parsed
   const remoteBin = configured?.startsWith('/') ? configured : remoteAgentPath(home)
-  const info = { home, remoteBin, installed, os, arch }
-  if (installed) hostCache.set(sshHost, { home, remoteBin, os, arch })
-  return info
+  return { home, remoteBin, os: 'posix', installed, drives: [], osName, arch }
 }
 
-async function uploadRemoteBinary(sshHost, localBin, remoteBin, remoteHome, remoteOs, remoteArch) {
+/**
+ * Windows probe: USERPROFILE, CPU arch, the agent builds already in `.waw/bin`,
+ * and the mounted drives.
+ *
+ * The binary name carries the target arch and the local content hash. Windows
+ * holds a lock on a running executable and refuses both overwrite and rename,
+ * so a new build is uploaded beside the old one and spawn picks the new name —
+ * "installed" therefore means "this exact build is there", not "some agent is
+ * there". The probe lists what IS there and the bridge compares, because the
+ * expected name depends on the arch this same answer reports.
+ *
+ * Drives are part of the same round-trip because a Windows host is one root per
+ * drive: without them the worker is fenced to its workspace drive and the
+ * browser cannot look at another one ("path outside allowed roots").
+ *
+ * `powershell` is tried first and `pwsh` only if the host refuses it, so a
+ * stock Windows pays one round-trip and a 5.1-less image still works.
+ */
+async function probeWindowsHost(sshHost) {
+  const script =
+    `$wawHome = $env:USERPROFILE\n` +
+    `Write-Output ('__WAWHOME__' + $wawHome)\n` +
+    `Write-Output ('__WAWARCH__' + $env:PROCESSOR_ARCHITECTURE)\n` +
+    `$wawBinDir = Join-Path $wawHome '.waw\\bin'\n` +
+    `if (Test-Path -LiteralPath $wawBinDir) {\n` +
+    `  Get-ChildItem -LiteralPath $wawBinDir -Filter 'waw-remote-agent-*.exe' -ErrorAction SilentlyContinue |` +
+    ` ForEach-Object { Write-Output ('__WAWBIN__' + $_.Name) }\n` +
+    `}\n` +
+    `foreach ($d in [IO.DriveInfo]::GetDrives()) {\n` +
+    `  if ($d.IsReady) { Write-Output ('__WAWDRIVE__' + $d.Name + '|' + $d.VolumeLabel) }\n` +
+    `}\n`
+  let psExe = 'powershell'
+  let out
+  try {
+    out = await run('ssh', [...sshBaseArgs(), sshHost, psScript(script, psExe)])
+  } catch (err) {
+    psExe = 'pwsh'
+    try {
+      out = await run('ssh', [...sshBaseArgs(), sshHost, psScript(script, psExe)])
+    } catch {
+      throw err
+    }
+  }
+  const parsed = parseWindowsProbe(out)
+  if (!parsed) throw new Error(`cannot resolve remote HOME on ${sshHost} (PowerShell probe)`)
+  const { home, arch } = parsed
+  if (!arch) throw new Error(`cannot determine CPU architecture on ${sshHost} (PowerShell probe)`)
+  const localBin = localBinary('windows', { arch })
+  const name = remoteBinName('windows', sha8(localBin), arch)
+  const installed = parsed.bins.includes(name)
+  // A host that answered the probe but enumerated nothing still has the drive
+  // its HOME lives on; never leave the browser with an empty drive list.
+  const drives = parsed.drives.length > 0 ? parsed.drives : normalizeDrives([`${home.slice(0, 2)}/`])
+  return {
+    home,
+    remoteBin: joinRemotePath(home, `.waw/bin/${name}`),
+    os: 'windows',
+    osName: 'windows',
+    arch,
+    psExe,
+    installed,
+    drives,
+  }
+}
+
+/**
+ * One SSH round-trip: resolve HOME + OS + whether the agent build is installed.
+ * Cached per host for the process lifetime.
+ *
+ * The POSIX probe runs first, so a Linux remote pays one round-trip. Only when
+ * it fails (a Windows host answers cmd.exe's "The system cannot find the path
+ * specified.") does the PowerShell probe run.
+ */
+async function resolveHostInstall(sshHost) {
+  const cached = hostCache.get(sshHost)
+  if (cached) return { ...cached }
+  const forced = process.env.WAW_REMOTE_OS?.trim().toLowerCase()
+  if (forced === 'windows') {
+    const info = await probeWindowsHost(sshHost)
+    hostCache.set(sshHost, info)
+    return info
+  }
+  try {
+    const info = await probePosixHost(sshHost)
+    hostCache.set(sshHost, info)
+    return info
+  } catch (err) {
+    if (forced === 'posix') throw err
+    const info = await probeWindowsHost(sshHost)
+    hostCache.set(sshHost, info)
+    return info
+  }
+}
+
+async function uploadRemoteBinary(sshHost, localBin, info) {
+  const { remoteBin, home: remoteHome, os, psExe = 'powershell' } = info
+  if (os === 'windows') {
+    const remoteDir = remoteBin.replace(/\/[^/]+$/, '')
+    const fileName = remoteBin.slice(remoteBin.lastIndexOf('/') + 1)
+    const remoteTmp = `${remoteDir}/${fileName}.tmp`
+    try {
+      await run('ssh', [
+        ...sshBaseArgs(),
+        sshHost,
+        psScript(psMkdir(psPath(remoteDir)), psExe),
+      ])
+      // scp resolves a relative target against the login user's home on both
+      // OpenSSH builds; an absolute drive path is not portable there.
+      await run('scp', [...scpBaseArgs(), localBin, `${sshHost}:.waw/bin/${fileName}.tmp`])
+      await run('ssh', [
+        ...sshBaseArgs(),
+        sshHost,
+        psScript(
+          `Move-Item -LiteralPath ${psQuote(psPath(remoteTmp))} ` +
+            `-Destination ${psQuote(psPath(remoteBin))} -Force`,
+          psExe,
+        ),
+      ])
+    } catch {
+      throw new Error(
+        `remote agent on ${sshHost} is unavailable (install/refresh failed; user command was not run). Retry once; do not diagnose upload tools or remote bin paths.`,
+      )
+    }
+    hostCache.set(sshHost, { ...info, installed: true })
+    return remoteBin
+  }
+
   const remoteDir = remoteBin.replace(/\/[^/]+$/, '') || `${remoteHome}/.waw/bin`
   // Upload to a sibling then mv: Linux refuses to open() a running executable for
   // truncate (ETXTBSY). Rename replaces the path while the old inode keeps serving.
@@ -383,23 +520,14 @@ async function uploadRemoteBinary(sshHost, localBin, remoteBin, remoteHome, remo
       `remote agent on ${sshHost} is unavailable (install/refresh failed; user command was not run). Retry once; do not diagnose upload tools or remote bin paths.`,
     )
   }
-  hostCache.set(sshHost, { home: remoteHome, remoteBin, os: remoteOs, arch: remoteArch })
+  hostCache.set(sshHost, { ...info, installed: true })
   return remoteBin
 }
 
-async function ensureRemoteBinary(sshHost, { force = false } = {}) {
+async function ensureRemoteBinary(sshHost, localBin, { force = false } = {}) {
   const info = await resolveHostInstall(sshHost)
-  if (!force && (info.installed || hostCache.has(sshHost))) {
-    hostCache.set(sshHost, {
-      home: info.home,
-      remoteBin: info.remoteBin,
-      os: info.os,
-      arch: info.arch,
-    })
-    return info.remoteBin
-  }
-  const localBin = localBinary({ os: info.os, arch: info.arch })
-  return uploadRemoteBinary(sshHost, localBin, info.remoteBin, info.home, info.os, info.arch)
+  if (!force && info.installed) return info.remoteBin
+  return uploadRemoteBinary(sshHost, localBin, info)
 }
 
 /**
@@ -421,6 +549,11 @@ export async function ensureRemoteTool(sshHost, localPath, name) {
 
   const job = (async () => {
     const info = await resolveHostInstall(host)
+    if (info.os === 'windows') {
+      throw new Error(
+        `远端 ${name} 在 Windows 主机上尚不支持（随包发布的是 POSIX 构建）；请改用本地工作区或只对远端做文件/命令操作`,
+      )
+    }
     const remoteDir = `${info.home.replace(/\/+$/, '')}/.waw/bin`
     const remotePath = `${remoteDir}/${name}`
     const localSize = statSync(localPath).size
@@ -482,15 +615,73 @@ function poolKey(sshHost, workspace) {
   return `${sshHost}\0${workspace}`
 }
 
+/**
+ * The shells this host's agent reported, stored where the host-side prompt and
+ * snapshot tracker read them synchronously. Same process, same global store
+ * convention as `__wawSessionWorkspaces` — the bridge is a runtime-loaded
+ * plugin and cannot import the host's TypeScript.
+ */
+function recordShellCapabilities(sshHost, result) {
+  const info = result && typeof result === 'object' ? result : {}
+  const os = info.os === 'windows' ? 'windows' : 'posix'
+  const shells = Array.isArray(info.shells)
+    ? info.shells.map(String)
+    : info.shell
+      ? [String(info.shell)]
+      : []
+  const caps = {
+    os,
+    defaultShell: String(info.shell ?? ''),
+    shells,
+    posixShell: String(info.posixShell ?? ''),
+    // An older worker has no capabilities field; on POSIX it is the only shell,
+    // so the POSIX scripts run there by definition.
+    posixScripts: info.capabilities ? Boolean(info.capabilities.posixScripts) : os === 'posix',
+  }
+  globalThis.__wawRemoteCapabilities = globalThis.__wawRemoteCapabilities || {}
+  globalThis.__wawRemoteCapabilities[sshHost] = caps
+}
+
 async function spawnAgent(sshHost, workspace, token, { forceInstall = false } = {}) {
   if (sshHost === 'local') {
-    const localBin = localBinary(hostTargetPlatform())
-    return spawn(localBin, ['--workspace', workspace, '--token', token], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
+    // `local` means the machine the app runs on, so its own target decides.
+    return spawn(
+      localBinary(process.platform === 'win32' ? 'windows' : 'posix', localTarget),
+      ['--workspace', workspace, '--token', token],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      },
+    )
   }
-  const remoteBin = await ensureRemoteBinary(sshHost, { force: forceInstall })
+  const info = await resolveHostInstall(sshHost)
+  const remoteBin = await ensureRemoteBinary(sshHost, localBinary(info.os, info), {
+    force: forceInstall,
+  })
+  if (info.os === 'windows') {
+    // PowerShell is the parent of the worker here: `&` runs the exe in this
+    // console, so the RPC frames on stdin/stdout pass straight through. The
+    // path and workspace are quoted for PowerShell, not the POSIX shell.
+    //
+    // Every mounted drive is an explicit root: the worker fences paths to
+    // `--workspace` + `--root`, and a Windows host keeps each drive as its own
+    // root, so without these the browser could never open `D:/…`.
+    const extraRoots = (info.drives ?? [])
+      .filter((drive) => !sameRemotePath(drive, workspace, 'windows'))
+      .map((drive) => ` --root ${psQuote(drive)}`)
+      .join('')
+    const remoteCmd =
+      `& ${psQuote(remoteBin)} --workspace ${psQuote(workspace)} --token ${psQuote(token)}${extraRoots}`
+    return spawn(
+      'ssh',
+      [...sshBaseArgs(), sshHost, powershellCommand(`${PS_PRELUDE}${remoteCmd}\n`, info.psExe)],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: sshChildEnv(),
+      },
+    )
+  }
   const remoteCmd = `${shQuote(remoteBin)} --workspace ${shQuote(workspace)} --token ${shQuote(token)}`
   return spawn('ssh', [...sshBaseArgs(), sshHost, remoteSh(remoteCmd)], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -503,11 +694,30 @@ async function spawnAgent(sshHost, workspace, token, { forceInstall = false } = 
  * @param {{ sshHost: string, root: string }} target
  * @param {{ forceInstall?: boolean }} [opts]
  */
-export async function ensureRemoteAgent(target, opts = {}) {
+export function ensureRemoteAgent(target, opts = {}) {
+  const sshHost = String(target?.sshHost || '').trim()
+  const workspace = normalizeRemoteRoot(target?.root)
+  if (!sshHost) return Promise.reject(new Error('sshHost required'))
+  if (!isAbsoluteRemoteRoot(workspace)) {
+    return Promise.reject(new Error('remote workspace must be absolute'))
+  }
+  const key = poolKey(sshHost, workspace)
+  if (!opts.forceInstall) {
+    const running = ensureInflight.get(key)
+    if (running) return running
+  }
+  const job = openRemoteAgent(target, opts).finally(() => {
+    if (ensureInflight.get(key) === job) ensureInflight.delete(key)
+  })
+  ensureInflight.set(key, job)
+  return job
+}
+
+async function openRemoteAgent(target, opts = {}) {
   const sshHost = String(target.sshHost || '').trim()
-  const workspace = String(target.root || '').replace(/\/+$/, '') || '/'
+  const workspace = normalizeRemoteRoot(target.root)
   if (!sshHost) throw new Error('sshHost required')
-  if (!isAbsoluteWorkspacePath(workspace)) throw new Error('remote workspace must be absolute')
+  if (!isAbsoluteRemoteRoot(workspace)) throw new Error('remote workspace must be absolute')
 
   const key = poolKey(sshHost, workspace)
   const healthTarget = { sshHost, root: workspace }
@@ -559,8 +769,12 @@ export async function ensureRemoteAgent(target, opts = {}) {
       dropRemoteAgent(conn)
       throw new Error(ping.error ?? 'remote agent ping failed')
     }
+    recordShellCapabilities(sshHost, ping.result)
     const ver = Number(ping.result?.protocolVersion ?? 0)
-    if (sshHost !== 'local' && ver < REQUIRED_PROTOCOL_VERSION && !opts.forceInstall) {
+    const cachedOs = hostCache.get(sshHost)?.os
+    const reportedOs = ping.result?.os === 'windows' ? 'windows' : cachedOs ?? 'posix'
+    const required = reportedOs === 'windows' ? REQUIRED_PROTOCOL_VERSION : POSIX_PROTOCOL_VERSION
+    if (sshHost !== 'local' && ver < required && !opts.forceInstall) {
       dropRemoteAgent(conn)
       hostCache.delete(sshHost)
       return await ensureRemoteAgent(target, { forceInstall: true })
@@ -589,13 +803,38 @@ export async function withRemoteAgent(target, fn) {
   }
 }
 
+/**
+ * The shells a target's agent reported, waiting out an in-flight warm.
+ *
+ * The host records capabilities when the agent answers `ping`. A run that
+ * starts right after a bind can beat that ping: the workspace snapshot then
+ * cannot tell whether the Windows host has Git Bash, and skipping the scripts
+ * would silently lose the run-level diff. Awaiting the warm (or opening the
+ * agent once) makes the answer deterministic for the first run too.
+ */
+export async function remoteShellCapabilities(target) {
+  const sshHost = String(target?.sshHost ?? '').trim()
+  const root = normalizeRemoteRoot(target?.root)
+  if (!sshHost || !isAbsoluteRemoteRoot(root)) return null
+  const cached = () => globalThis.__wawRemoteCapabilities?.[sshHost] ?? null
+  if (cached()) return cached()
+  const warm = warmInflight.get(poolKey(sshHost, root))
+  try {
+    if (warm) await warm
+    else await ensureRemoteAgent({ sshHost, root })
+  } catch {
+    /* unknown stays unknown; the caller degrades rather than guessing */
+  }
+  return cached()
+}
+
 /** Fire-and-forget warm so the first user tool call skips cold SSH. */
 export function warmRemoteAgent(target) {
   const sshHost = String(target?.sshHost || '').trim()
-  const root = String(target?.root || '').replace(/\/+$/, '') || '/'
-  if (!sshHost || !isAbsoluteWorkspacePath(root)) return
+  const root = normalizeRemoteRoot(target?.root)
+  if (!sshHost || !isAbsoluteRemoteRoot(root)) return
   const key = poolKey(sshHost, root)
-  if (pool.has(key) || warmInflight.has(key)) return
+  if (pool.has(key) || warmInflight.has(key) || ensureInflight.has(key)) return
   const job = ensureRemoteAgent({ sshHost, root })
     .catch(() => undefined)
     .finally(() => {
@@ -618,8 +857,8 @@ const probeInflight = new Map()
  */
 export async function probeRemoteAgent(target, { timeoutMs = 25_000 } = {}) {
   const sshHost = String(target?.sshHost ?? '').trim()
-  const root = String(target?.root ?? '').replace(/\/+$/, '') || '/'
-  if (!sshHost || !isAbsoluteWorkspacePath(root)) {
+  const root = normalizeRemoteRoot(target?.root)
+  if (!sshHost || !isAbsoluteRemoteRoot(root)) {
     return {
       sshHost,
       root,
@@ -695,19 +934,40 @@ export async function disconnectAllRemoteAgents() {
 }
 
 function joinRemote(base, name) {
-  if (base === '/') return `/${name}`
-  return `${base.replace(/\/+$/, '')}/${name}`
+  return joinRemotePath(base, name)
 }
 
-/** Reuse a live agent only if its workspace contains `path`; else open one at `/`. */
-async function agentForBrowse(sshHost, path) {
+/**
+ * Reuse a live agent only if its workspace contains `path`; else open one at the
+ * browse root (`/` on POSIX, the HOME drive on Windows — a drive root is the
+ * only place the worker's path fence lets a browse-only agent look at).
+ */
+async function agentForBrowse(sshHost, path, info) {
+  const within = (root) => remotePathInside(root, path, info.os)
   for (const conn of pool.values()) {
     if (conn.sshHost !== sshHost) continue
     if (conn.child.killed || conn.child.exitCode != null) continue
-    const ws = conn.workspace
-    if (ws === '/' || path === ws || path.startsWith(`${ws}/`)) return conn
+    // Every Windows worker is spawned with all drives as roots, so a pooled one
+    // can list any drive — not only the workspace it was opened for.
+    const extra = info.os === 'windows' ? (info.drives ?? []) : []
+    if (within(conn.workspace) || extra.some(within)) return conn
   }
-  return ensureRemoteAgent({ sshHost, root: '/' })
+  return ensureRemoteAgent({ sshHost, root: browseRoot(info.os, info) })
+}
+
+/**
+ * Mounted drives of a remote host, for the directory browser's drive switcher.
+ *
+ * POSIX hosts are one tree from `/`, so they have no entries here. Windows hosts
+ * answer with `[{ name: 'C:', path: 'C:/' }, …]`; the browser opens `<path>` and
+ * the breadcrumb restarts at that drive.
+ */
+export async function remoteDrives(sshHost) {
+  const host = String(sshHost || '').trim()
+  if (!host) return []
+  const info = await resolveHostInstall(host)
+  if (info.os !== 'windows') return []
+  return (info.drives ?? []).map((path) => ({ name: path.replace(/\/$/, ''), path }))
 }
 
 /** Browse helpers: HOME via cache/SSH only — no agent spawn just for $HOME. */
@@ -715,8 +975,7 @@ export async function remoteHomeDir(sshHost) {
   const cached = hostCache.get(sshHost)
   if (cached?.home) return cached.home
   const info = await resolveHostInstall(sshHost)
-  if (info.installed) hostCache.set(sshHost, { home: info.home, remoteBin: info.remoteBin, os: info.os, arch: info.arch })
-  return info.home.replace(/\/+$/, '') || '/'
+  return normalizeRemoteRoot(info.home)
 }
 
 function mapListEntries(remote, raw) {
@@ -741,9 +1000,11 @@ function mapListEntries(remote, raw) {
 }
 
 export async function listRemoteDirectory(sshHost, path) {
-  const remote = String(path || '/').replace(/\/+$/, '') || '/'
-  if (!remote.startsWith('/')) throw new Error('需要远端绝对路径')
-  let conn = await agentForBrowse(sshHost, remote)
+  const info = await resolveHostInstall(sshHost)
+  const asked = String(path ?? '').trim()
+  const remote = asked ? normalizeRemoteRoot(asked) : browseRoot(info.os, info)
+  if (!isAbsoluteRemoteRoot(remote)) throw new Error('需要远端绝对路径')
+  let conn = await agentForBrowse(sshHost, remote, info)
   try {
     const resp = await conn.rpc.call('list_dir', { path: remote }, { timeoutMs: 30_000 })
     if (!resp.ok) throw new Error(resp.error ?? 'list failed')
@@ -751,7 +1012,7 @@ export async function listRemoteDirectory(sshHost, path) {
   } catch (err) {
     if (!isTransportError(err)) throw err
     dropRemoteAgent(conn)
-    conn = await agentForBrowse(sshHost, remote)
+    conn = await agentForBrowse(sshHost, remote, info)
     const resp = await conn.rpc.call('list_dir', { path: remote }, { timeoutMs: 30_000 })
     if (!resp.ok) throw new Error(resp.error ?? 'list failed')
     return mapListEntries(remote, resp.result?.entries)

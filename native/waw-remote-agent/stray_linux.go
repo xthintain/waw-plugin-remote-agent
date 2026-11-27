@@ -10,12 +10,16 @@ import (
 	"time"
 )
 
-// killStrayRemoteAgents：Linux 下扫描 /proc，杀掉同一 binary 的所有非 daemon 进程。
+// killStrayRemoteAgents scans /proc and stops every process of the same binary
+// that is not a daemon. Direct children are already handled by stopWorker.
 func killStrayRemoteAgents(self string) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return
 	}
+	// `self` is the path the daemon was started as and may itself be a link
+	// (nix store, /usr/local/bin, a symlinked workspace); /proc/<pid>/exe is the
+	// resolved image. Compare both forms so neither spelling misses the other.
 	realSelf := realPath(self)
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())

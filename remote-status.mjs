@@ -17,6 +17,8 @@
  * at the same workspace share one entry.
  */
 
+import { isAbsoluteRemoteRoot, normalizeRemoteRoot } from './remote-os.mjs'
+
 /** Error text is shown in a tooltip; collapse whitespace and keep it short. */
 const ERROR_MAX = 240
 
@@ -39,8 +41,8 @@ function cleanError(value) {
 /** Normalize a target, or null when it could never name a remote workspace. */
 function normalize(target) {
   const sshHost = String(target?.sshHost ?? '').trim()
-  const root = String(target?.root ?? '').replace(/\/+$/, '') || '/'
-  if (!sshHost || !root.startsWith('/')) return null
+  const root = normalizeRemoteRoot(target?.root)
+  if (!sshHost || !isAbsoluteRemoteRoot(root)) return null
   return { sshHost, root }
 }
 

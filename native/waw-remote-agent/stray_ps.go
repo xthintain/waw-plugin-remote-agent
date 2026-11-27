@@ -5,8 +5,14 @@ import (
 	"strings"
 )
 
-// findStrayPIDsFromPS parses `ps -axo pid=,command=` output (macOS/BSD format)
-// and returns PIDs running the same executable as self without `--daemon`.
+// findStrayPIDsFromPS parses `ps -axo pid=,command=` output (macOS/BSD format:
+// "PID COMMAND…", one process per line) and returns the PIDs that run the same
+// executable as self without `--daemon`.
+//
+// The command column is free text that ps does not quote, and an installed path
+// may contain spaces ("Application Support"), so matching tries the known
+// spellings of the path as an exact prefix and only then compares the real path
+// of the first word.
 func findStrayPIDsFromPS(psOutput, self string, selfPID int) []int {
 	if strings.TrimSpace(self) == "" {
 		return nil
@@ -49,6 +55,8 @@ func findStrayPIDsFromPS(psOutput, self string, selfPID int) []int {
 	return pids
 }
 
+// matchExecutablePrefix reports whether cmdLine starts by running one of the
+// given spellings of the executable, and returns the arguments after it.
 func matchExecutablePrefix(cmdLine, self, realSelf string) (string, bool) {
 	for _, target := range []string{self, realSelf} {
 		if target == "" {

@@ -55,7 +55,10 @@ try {
   const ping = await rpc.call('ping', {})
   assert.equal(ping.ok, true, `ping failed: ${JSON.stringify(ping)}`)
   assert.equal(ping.result.os, 'darwin', `expected os=darwin, got ${ping.result.os}`)
-  assert.ok(['arm64', 'amd64'].includes(ping.result.arch), `unexpected arch: ${ping.result.arch}`)
+  // The agent does not report arch; the probe does (`uname -m`). What matters
+  // here is that the binary runs at all and speaks the protocol the bridge wants.
+  assert.equal(ping.result.protocolVersion, 6, `unexpected protocol: ${ping.result.protocolVersion}`)
+  assert.ok(ping.result.shells.length > 0, 'no shell reported')
 
   const write = await rpc.call('write_file', { path: 'hello.txt', content: 'macos-ok', mkdir: true })
   assert.equal(write.ok, true)
@@ -74,7 +77,7 @@ try {
   assert.equal(killed.result.state, 'killed')
 
   await rpc.call('shutdown', {})
-  console.log(`macOS RPC smoke OK: darwin/${ping.result.arch}`)
+  console.log(`macOS RPC smoke OK: darwin/${process.arch}`)
 } finally {
   rpc.close()
   if (!child.killed) child.kill('SIGTERM')
@@ -89,8 +92,9 @@ echo "==> [5/5] 运行 Node 单元测试与 install.sh 隔离目录冒烟"
   cd "$ROOT"
   node --test test/
   TUI_CONFIG_DIR="$TMP_WS/tui-config" ./install.sh --link
-  test -L "$TMP_WS/tui-config/plugins/remote-agent.plugin.mjs"
-  test -L "$TMP_WS/tui-config/plugins/remote-bridge.mjs"
+  for f in remote-agent.plugin.mjs remote-bridge.mjs remote-exec.mjs remote-os.mjs remote-rpc.mjs remote-status.mjs; do
+    test -L "$TMP_WS/tui-config/plugins/$f" || { echo "error: $f 没被装进插件目录" >&2; exit 1; }
+  done
 )
 
 echo

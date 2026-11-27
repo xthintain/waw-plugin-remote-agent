@@ -14,6 +14,25 @@ SSH / WS / HTTP 远端无 UI 工具面（Go）。帧协议见 `docs/plans/2026-0
 HTTP 是 `register → poll → reply`，响应由后台 goroutine 提交，处理本身不阻塞。两者同时给时
 以 `--dial-http` 为准（stderr 会提示）。
 
+## 平台：POSIX 与 Windows
+
+- 路径与文件 RPC（`read_file`/`write_file`/`stat`/`list_dir`）走 Go 的 `filepath`，Windows 的盘符与反斜杠本来就支持；允许根判断在 Windows 上大小写不敏感。
+- **命令执行**按平台检测 shell（`shell.go`）：Linux/macOS 用 `bash -lc`（无 bash 退 `sh -lc`）；Windows 默认 `pwsh`（7+）→ `powershell`（5.1），并额外探测 **Git Bash**（`Git\bin\bash.exe`，`uname -s` 为 `MINGW*`/`MSYS*`；WSL 的 `System32\bash.exe` 不算）。PowerShell 用 `-Command` 执行、传播 `$LASTEXITCODE`、UTF-8 输出；不兜底 cmd.exe。
+- **逐条选择 shell**：`exec` 与 `job_start` 接受可选 `shell`（`auto`/`powershell`/`gitbash`/`posix`）。同一台 Windows 主机上两种 shell 都可用时，由调用方按命令语法选择；主机没有的那个会返回可用列表，不会静默换 shell。`ping` 回报 `os` / `shell` / `shells` / `posixShell` / `capabilities`（`posixScripts` 有 Git Bash 即为真）。
+- 协议号 6：Windows 主机必须用 6，POSIX 仍接受 5。
+- **Windows 上的进程树**：`proc_windows.go` 用 `taskkill /T /F` 结束整棵树（`job_kill` 与 exec 超时共用），daemon 的停止也走 `terminateProcess`。
+- **残留进程回收分三端**：Linux 读 `/proc`（`stray_linux.go`），macOS 没有 procfs，改问 `/bin/ps -axo pid=,command=`（`stray_darwin.go`，解析在 `stray_ps.go`），Windows 按镜像名 + 命令行过滤（`stray_windows.go`）。三端都只回收同二进制的非 `--daemon` 进程；daemon 的直接子进程由 `stopWorker` 处理。
+- 构建（本机那份供桌面 spawn，其余按探测到的远端 OS/arch 上传；macOS 主机因此产 darwin 而不是 Linux 二进制）：
+
+```bash
+./build.sh   # 本机目标（自动识别 linux/darwin/windows × amd64/arm64）+ linux/amd64 + windows/amd64 + windows/arm64
+./build.sh --all                            # linux / darwin / windows × amd64 / arm64
+WAW_REMOTE_TARGETS=linux/amd64 ./build.sh   # 只多产指定的那份（本机目标始终补入）
+pwsh -File build.ps1                        # Windows 本机构建
+```
+
+`dist/waw-remote-agent[.exe]`（不带 os/arch）永远是**本机目标**的产物：宿主默认路径、e2e 与 smoke 都按这个名字取本地 pipe 用的二进制。
+
 ## 两种运行模式
 
 ### 1. worker（工具面，原单进程）—— stdio / WS / HTTP
@@ -62,7 +81,7 @@ HTTP 模式下 token 同时用作 hub 的 bearer（`WAW_TUI_REMOTE_HUB_TOKEN` �
 #### 生命周期（WAW 开关机语义）
 
 - **控制面未启动**：daemon 只做带退避的重连，**不派生 worker**（不会在 WAW 没开时唤醒远端 agent）。
-- **WAW 关闭 / 连接断开**：立即暂停 worker 的自动重启（避免对着不存在的控制面 500ms 空转），已有进程保留到 `--idle-stop` 宽限期（默认 `30m`）；到期后 daemon 停止所有 worker（Linux 通过 `/proc`、macOS 通过 `ps` 同时清扫同一 binary 的其它非 daemon 进程），**daemon 自身常驻**。
+- **WAW 关闭 / 连接断开**：立即暂停 worker 的自动重启（避免对着不存在的控制面 500ms 空转），已有进程保留到 `--idle-stop` 宽限期（默认 `30m`）；到期后 daemon 停止所有 worker（Linux 下同时清扫同一 binary 的其它非 daemon 进程），**daemon 自身常驻**。
 - **WAW 重新启动**：daemon 重连成功即取消回收并唤醒 worker。
 - 显式 `daemon_stop` 的停止意图跨重连保持；`daemon_start` / `daemon_restart` 才会重新拉起。
 - 回收宽限期可用 `--idle-stop 10m` 调整（默认 `30m`）。

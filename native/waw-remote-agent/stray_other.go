@@ -1,7 +1,9 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package main
 
-// killStrayRemoteAgents：Windows 等无 /proc 与 BSD ps 的平台静默跳过
-// （直接子进程已由 stopWorker 处理）。
+// killStrayRemoteAgents is a no-op where neither procfs nor a BSD `ps` layout is
+// assumed: the daemon's own children are already handled by stopWorker, and this
+// build has no process table it knows how to read. Windows has its own sweep
+// (stray_windows.go).
 func killStrayRemoteAgents(_ string) {}

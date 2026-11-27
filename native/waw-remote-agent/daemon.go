@@ -264,6 +264,10 @@ func (d *daemon) killStrayWorkers() {
 	killStrayRemoteAgents(self)
 }
 
+// killStrayRemoteAgents is platform-specific: /proc on Unix and a process
+// listing filtered by image + command line on Windows (see stray_*.go). The
+// daemon's own children are already handled by stopWorker.
+
 func dialDaemonWS(wsURL, token, agentID, workspace string) (*websocket.Conn, error) {
 	u, err := url.Parse(wsURL)
 	if err != nil {
@@ -327,6 +331,10 @@ func (d *daemon) startWorker(self string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	// A Job Object with KILL_ON_JOB_CLOSE is the only way to guarantee that a
+	// force-killed daemon cannot leave its worker behind on Windows (best
+	// effort; a host that refuses the job still has the tasklist sweep).
+	attachWorkerToJob(cmd.Process.Pid)
 	done := make(chan struct{})
 	d.mu.Lock()
 	d.workerCmd = cmd
@@ -381,8 +389,8 @@ func (d *daemon) stopWorker() bool {
 	d.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
-		// Unix/macOS 先 SIGTERM，Windows 直接 Kill，随后 SIGKILL 兜底
-		terminateProcess(cmd.Process)
+		// 先优雅终止（POSIX SIGTERM / Windows 进程树），随后 Kill 兜底
+		terminateProcess(cmd)
 		go func(p *os.Process, done chan struct{}) {
 			if done != nil {
 				select {

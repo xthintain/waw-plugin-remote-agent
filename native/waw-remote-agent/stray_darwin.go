@@ -9,7 +9,9 @@ import (
 	"time"
 )
 
-// killStrayRemoteAgents：macOS 无 /proc，通过 ps 扫描同一 binary 的非 daemon 进程并回收。
+// killStrayRemoteAgents does what the Linux version reads from /proc: macOS has
+// no procfs, so it asks `ps` which processes run this binary and keeps the ones
+// without --daemon. Direct children are already handled by stopWorker.
 func killStrayRemoteAgents(self string) {
 	out, err := exec.Command("/bin/ps", "-axo", "pid=,command=").Output()
 	if err != nil {

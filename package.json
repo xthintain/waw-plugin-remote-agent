@@ -3,19 +3,21 @@
   "version": "0.5.1",
   "private": true,
   "type": "module",
-  "description": "waw 桌面/TUI 的远程工作区插件：SSH 目标、远端 shell/fs 工具、后台 job，配套 Go 端 waw-remote-agent。",
+  "description": "waw 桌面/TUI 的远程工作区插件：SSH 目标、远端 shell/fs 工具、后台 job，配套 Go 端 waw-remote-agent（Linux / macOS / Windows）。",
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test test/",
     "sync": "./scripts/sync-from-web-agent.sh",
     "sync:check": "./scripts/sync-from-web-agent.sh --check",
     "install:plugin": "./install.sh",
-    "build:agent": "./native/waw-remote-agent/build.sh"
+    "build:agent": "./native/waw-remote-agent/build.sh",
+    "build:agent:all": "./native/waw-remote-agent/build.sh --all",
+    "test:agent": "cd native/waw-remote-agent && go test ./..."
   },
   "upstream": {
-    "repo": "web-agent",
+    "repo": "waw",
     "path": "desktop/agent-desktop/src/plugins + native/waw-remote-agent",
-    "commit": "1d213540"
+    "commit": "d53372bd"
   },
   "license": "MIT"
 }

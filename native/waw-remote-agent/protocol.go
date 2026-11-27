@@ -30,13 +30,18 @@ const maxOutputBytes = 512 << 10
  * the host must refuse an older binary — an added method alone does not, because
  * `ping.methods` already lets the host route around it.
  *
+ * 6: Windows hosts run commands through PowerShell and advertise it in `ping`
+ * (`os` / `shell` / `capabilities`). Only the Windows bootstrap requires 6; POSIX
+ * remotes keep working on 5 so the upgrade does not force a reinstall of every
+ * existing Linux agent.
+ *
  * `mkdir` and `move` were removed in 5: `exec` expresses both exactly, and two
  * implementations of the same operation meant two sets of semantics to keep in
  * step. `remove` keeps its handler because the "cannot remove a configured root"
  * guard has no shell equivalent; `stat` keeps its because parsing `ls` output is
  * not portable.
  */
-const protocolVersion = 5
+const protocolVersion = 6
 
 var workerMethods = []string{
 	"ping",
@@ -82,6 +87,8 @@ type execParams struct {
 	Command   string `json:"command"`
 	Cwd       string `json:"cwd"`
 	TimeoutMs int    `json:"timeoutMs"`
+	/** Which shell the command was written for: auto (default), powershell, gitbash/posix. */
+	Shell string `json:"shell"`
 }
 
 type pathParams struct {
@@ -98,6 +105,8 @@ type removeParams struct {
 type jobStartParams struct {
 	Command string `json:"command"`
 	Cwd     string `json:"cwd"`
+	/** Same meaning as exec's shell: auto (default), powershell, gitbash/posix. */
+	Shell string `json:"shell"`
 }
 
 type jobIDParams struct {
@@ -123,8 +132,8 @@ type agent struct {
 	workspace string
 	/** 允许访问的根目录集合（第一个是默认工作区）。 */
 	roots     []string
-	/** 执行 shell 的二进制：有 bash 用 bash，没有则退到 sh。 */
-	shell     string
+	/** 本机可用的 shell：POSIX 只有 bash/sh；Windows 有 PowerShell + 可选 Git Bash（见 shell.go）。 */
+	shells    shellSet
 	token     string
 	agentID   string
 	mu        sync.Mutex
@@ -163,7 +172,7 @@ func newAgent(workspace, token, agentID string, writer frameWriter, roots ...str
 	return &agent{
 		workspace: workspace,
 		roots:     allowed,
-		shell:     pickShell(),
+		shells:    defaultShells(),
 		token:     token,
 		agentID:   agentID,
 		cancels:   make(map[string]context.CancelFunc),
@@ -231,15 +240,33 @@ func (a *agent) handle(req request) {
 	switch req.Method {
 	case "ping":
 		host, _ := os.Hostname()
+		shellError := ""
+		if a.shells.err != nil {
+			shellError = a.shells.err.Error()
+		}
+		posixShell := ""
+		if a.shells.posix != nil {
+			posixShell = a.shells.posix.name
+		}
 		_ = a.writeResponse(response{ID: req.ID, OK: true, Result: map[string]interface{}{
 			"pong":            "ok",
 			"hostname":        host,
-			"os":              runtime.GOOS,
-			"arch":            runtime.GOARCH,
 			"workspace":       a.workspace,
 			"agentId":         a.agentID,
 			"roots":           a.roots,
 			"protocolVersion": protocolVersion,
+			// The host has to know WHICH shells the model's commands can land in:
+			// a Windows remote defaults to PowerShell and may also have Git Bash,
+			// which is what makes the POSIX-only tools (snapshots, codemap) usable.
+			"os":         runtime.GOOS,
+			"shell":      a.shells.primary.name,
+			"shells":     a.shells.names,
+			"posixShell": posixShell,
+			"shellError": shellError,
+			"capabilities": map[string]interface{}{
+				"posixScripts": a.shells.posix != nil,
+				"powershell":   a.shells.err == nil && a.shells.primary.flavor == "powershell",
+			},
 			// The tool surface, advertised so the host routes only what this
 			// binary can actually do — a host-side hardcoded list went stale
 			// every time a method was added or removed.
@@ -320,8 +347,13 @@ func (a *agent) handleExec(req request) {
 		a.mu.Unlock()
 	}()
 
-	cmd := exec.CommandContext(ctx, a.shell, "-lc", cmdLine)
+	cmd, shellErr := a.commandFor(ctx, p.Shell, cmdLine)
+	if shellErr != nil {
+		_ = a.writeResponse(response{ID: req.ID, OK: false, Error: shellErr.Error()})
+		return
+	}
 	cmd.Dir = cwd
+	armCancel(cmd)
 	stdout, errOut, err := runCapture(cmd)
 	exit := 0
 	if err != nil {
@@ -567,16 +599,6 @@ func (a *agent) resolveInside(raw string) (string, error) {
 		}
 	}
 	return "", errors.New("path outside allowed roots")
-}
-
-// pickShell：优先 bash；macOS/精简镜像缺失 bash 时依次回退到 zsh、sh。
-func pickShell() string {
-	for _, candidate := range []string{"bash", "zsh"} {
-		if _, err := exec.LookPath(candidate); err == nil {
-			return candidate
-		}
-	}
-	return "sh"
 }
 
 func (a *agent) writeResponse(resp response) error {

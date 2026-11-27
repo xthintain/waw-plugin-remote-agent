@@ -16,6 +16,7 @@ package main
  */
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -153,7 +154,15 @@ func (a *agent) handleJobStart(req request) {
 		return
 	}
 
-	cmd := exec.Command(a.shell, "-lc", cmdLine)
+	cmd, shellErr := a.commandFor(context.Background(), p.Shell, cmdLine)
+	if shellErr != nil {
+		_ = outFile.Close()
+		_ = errFile.Close()
+		_ = os.Remove(outPath)
+		_ = os.Remove(errPath)
+		_ = a.writeResponse(response{ID: req.ID, OK: false, Error: shellErr.Error()})
+		return
+	}
 	cmd.Dir = cwd
 	cmd.Stdout = outFile
 	cmd.Stderr = errFile

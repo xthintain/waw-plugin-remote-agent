@@ -22,6 +22,14 @@ jobs:
         with:
           node-version: '20'
 
+      # A shipped module that does not parse fails at plugin load with a stack
+      # trace in the user's console; catching it here is cheap.
+      - name: Syntax-check the scripts and modules
+        shell: bash
+        run: |
+          for f in install.sh scripts/*.sh native/waw-remote-agent/build.sh; do bash -n "$f"; done
+          for f in ./*.mjs; do node --check "$f"; done
+
       - name: Run Node tests
         run: node --test test/
 
@@ -35,6 +43,10 @@ jobs:
         run: .\native\waw-remote-agent\build.ps1
 
       - name: Run Go vet and tests
+        # bash, not the runner's default shell: pwsh only reports the last
+        # command's exit code, so a failing `go vet` would be masked by passing
+        # tests on the Windows leg.
+        shell: bash
         working-directory: native/waw-remote-agent
         run: |
           go vet ./...

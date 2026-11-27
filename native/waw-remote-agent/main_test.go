@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -30,6 +31,12 @@ func TestResolveInsideFence(t *testing.T) {
 }
 
 func TestResolveInsideRootWorkspace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// "/" is not an absolute path on Windows (only volume-qualified paths
+		// are), so the POSIX "workspace is the filesystem root" premise does not
+		// hold there.
+		t.Skip("POSIX root workspace semantics")
+	}
 	a := newAgent("/", "t", "id", &stdioWriter{w: io.Discard})
 	got, err := a.resolveInside("/workspace")
 	if err != nil {

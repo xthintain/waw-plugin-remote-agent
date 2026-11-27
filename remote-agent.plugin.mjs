@@ -13,6 +13,8 @@
  * UI (settingsSection.render) — not a built-in Settings nav item.
  */
 
+import { isAbsoluteRemoteRoot, normalizeRemoteRoot, remoteLocation } from './remote-os.mjs'
+
 const COLORS = {
   accent: '#2F6FED',
   ink: '#1a1f2c',
@@ -140,13 +142,7 @@ function explainDialWs(raw) {
 function explainWorkspacePath(raw) {
   const location = String(raw ?? '').trim()
   if (!location) {
-    return { ok: false, error: '请选择或填写远端工作区绝对路径，例如 /data/ws' }
-  }
-  if (!location.startsWith('/')) {
-    return {
-      ok: false,
-      error: `工作区「${location}」不是绝对路径。请用 / 开头的目录（可用「浏览」像文件管理器那样选）。`,
-    }
+    return { ok: false, error: '请选择或填写远端工作区绝对路径，例如 /data/ws 或 C:/Users/me/ws' }
   }
   if (location.includes('://')) {
     return {
@@ -154,7 +150,13 @@ function explainWorkspacePath(raw) {
       error: `工作区应是文件系统路径，不要写 URL。当前「${location}」像连接串——若要用逆向 WS，请把鉴权改成「预装 Agent（WS 逆向）」。`,
     }
   }
-  return { ok: true, location }
+  if (!isAbsoluteRemoteRoot(location)) {
+    return {
+      ok: false,
+      error: `工作区「${location}」不是绝对路径。请用以 / 开头的目录（POSIX）或 C:/…（Windows）；可用「浏览」像文件管理器那样选。`,
+    }
+  }
+  return { ok: true, location: normalizeRemoteRoot(location) }
 }
 
 export default async function remoteAgent(api) {
@@ -438,7 +440,8 @@ export default async function remoteAgent(api) {
 
     async function publishProject(row) {
       if (row.authKind !== 'sshConfig' || !row.host) return
-      const location = `ssh://${row.host}${row.remoteWorkspaceRoot}`
+      const location = remoteLocation(row.host, row.remoteWorkspaceRoot)
+      if (!location) return
       const project = {
         id: row.id,
         name: row.name,
@@ -537,7 +540,7 @@ export default async function remoteAgent(api) {
     if (browsing && FolderBrowser) {
       return h(FolderBrowser, {
         sshHost: authKind === 'sshConfig' ? host.trim() : undefined,
-        initialPath: remoteRoot.startsWith('/') ? remoteRoot : '',
+        initialPath: isAbsoluteRemoteRoot(remoteRoot) ? normalizeRemoteRoot(remoteRoot) : '',
         onCancel: () => setBrowsing(false),
         onSelect: (selected) => {
           setRemoteRoot(selected)

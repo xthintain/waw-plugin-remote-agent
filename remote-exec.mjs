@@ -10,9 +10,16 @@
 import { existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import {
+  isAbsoluteRemoteRoot,
+  normalizeRemoteRoot,
+  psQuote,
+  remoteFlavorOf,
+  toForwardSlashes,
+} from './remote-os.mjs'
+import {
   disconnectAllRemoteAgents,
   ensureRemoteTool,
-  isAbsoluteWorkspacePath,
+  remoteShellCapabilities,
   shQuote,
   withRemoteAgent,
 } from './remote-bridge.mjs'
@@ -39,20 +46,75 @@ export function activeWorkspace(sessionId) {
   if (!map || typeof map !== 'object') return null
   const key = String(sessionId ?? '').trim()
   const value = map[key === 'new' ? '' : key]
-  if (!value || value.kind !== 'remote' || !value.sshHost || !isAbsoluteWorkspacePath(value.root)) {
+  if (!value || value.kind !== 'remote' || !value.sshHost || !isAbsoluteRemoteRoot(value.root)) {
     return null
   }
-  return value
+  return { ...value, root: normalizeRemoteRoot(value.root) }
 }
 
 /** Map model cwd (often "." / relative) onto the remote workspace root. */
 export function resolveRemoteCwd(wsRoot, cwd) {
-  const root = String(wsRoot || '/').replace(/\/+$/, '') || '/'
+  const root = normalizeRemoteRoot(wsRoot)
+  const flavor = remoteFlavorOf(root)
   if (cwd == null || cwd === '' || cwd === '.' || cwd === './') return root
-  const raw = String(cwd)
-  if (isAbsoluteWorkspacePath(raw)) return raw.replace(/[\\/]+$/, '') || '/'
+  const raw = toForwardSlashes(cwd)
+  if (flavor === 'windows') {
+    if (/^[A-Za-z]:\//.test(raw)) return normalizeRemoteRoot(raw)
+    // `/x` on Windows is the current drive's root, not a path under the root.
+    if (raw.startsWith('/')) return normalizeRemoteRoot(`${root.slice(0, 2)}${raw}`)
+    return normalizeRemoteRoot(`${root}/${raw.replace(/^\.\//, '')}`)
+  }
+  if (raw.startsWith('/')) return raw.replace(/\/+$/, '') || '/'
   const base = root === '/' ? '' : root
   return `${base}/${raw.replace(/^\.\//, '')}`.replace(/\/+$/, '') || '/'
+}
+
+/** Above this a file is not a source edit's line delta; reading it would stall a turn. */
+export const LINE_COUNT_MAX_BYTES = 20 << 20
+
+/**
+ * The shell the remote agent runs to measure one file for the edit ledger.
+ *
+ * `wc -l` counts newline bytes, while `tui/src/agent/file-edit-ledger.ts` counts
+ * the entries of a `\r?\n` split: every split yields one more entry than there
+ * are newlines (an empty file is the special case, and counts as 0). Adding
+ * that entry back keeps a remote `+N` the same number the same file would show
+ * in a local conversation.
+ */
+export function lineCountCommand(path, flavor = 'posix') {
+  if (flavor === 'windows') {
+    // Same arithmetic as the POSIX branch: newline count + 1, empty file 0.
+    // `[IO.File]::ReadAllText` is used rather than Get-Content so CRLF and a
+    // missing final newline count exactly like the local ledger's `\r?\n` split.
+    const p = psQuote(toForwardSlashes(path))
+    return (
+      `if (Test-Path -LiteralPath ${p} -PathType Leaf) { ` +
+      `$s = (Get-Item -LiteralPath ${p}).Length; ` +
+      `if ($s -gt ${LINE_COUNT_MAX_BYTES}) { 'TOOBIG' } else { ` +
+      `if ($s -eq 0) { 0 } else { ([regex]::Matches([IO.File]::ReadAllText(${p}), "\\r?\\n")).Count + 1 } } ` +
+      `} elseif (Test-Path -LiteralPath ${p}) { 'NOTFILE' } else { 'MISSING' }`
+    )
+  }
+  const p = shQuote(path)
+  return (
+    `if [ -f ${p} ]; then ` +
+    `s=$(wc -c < ${p}); ` +
+    `if [ "$s" -gt ${LINE_COUNT_MAX_BYTES} ]; then echo TOOBIG; else ` +
+    `n=$(wc -l < ${p}); ` +
+    `if [ "$s" -gt 0 ]; then n=$((n + 1)); fi; ` +
+    `echo "$n"; fi; ` +
+    `elif [ -e ${p} ]; then echo NOTFILE; else echo MISSING; fi`
+  )
+}
+
+/** A count, or why there is none — never a made-up zero. */
+export function parseLineCount(stdout) {
+  const text = String(stdout ?? '').trim()
+  if (/^\d+$/.test(text)) return { lines: Number(text) }
+  if (text === 'MISSING') return { reason: 'missing' }
+  if (text === 'NOTFILE') return { reason: 'not-file' }
+  if (text === 'TOOBIG') return { reason: 'too-large' }
+  return { reason: 'error' }
 }
 
 async function rpc(ws, method, params, opts = {}) {
@@ -80,6 +142,7 @@ function primitivesFor(ws) {
           command,
           cwd: resolveRemoteCwd(ws.root, opts.cwd),
           timeoutMs: opts.timeoutMs ?? 30_000,
+          ...(opts.shell ? { shell: String(opts.shell) } : {}),
         },
         { timeoutMs: (opts.timeoutMs ?? 30_000) + 5_000, signal: opts.signal },
       )
@@ -122,6 +185,7 @@ function primitivesFor(ws) {
       const result = await rpc(ws, 'job_start', {
         command,
         cwd: resolveRemoteCwd(ws.root, opts?.cwd),
+        ...(opts?.shell ? { shell: String(opts.shell) } : {}),
       })
       return {
         jobId: String(result.jobId ?? ''),
@@ -146,6 +210,33 @@ function primitivesFor(ws) {
     },
     async jobKill(jobId) {
       await rpc(ws, 'job_kill', { jobId })
+    },
+    /**
+     * Deliberately `exec`, not `read_file`/`stat`: the agent fences its file
+     * RPCs to the configured roots, while `shell::exec` may redirect anywhere
+     * (a /tmp scratch file included). The measurement must reach everything the
+     * write could reach, or those rows stay unknown for no reason.
+     */
+    /**
+     * Shells the host offers, resolved through `ping`. The snapshot tracker
+     * calls this when a run starts before the bind's warm finished.
+     */
+    async shellCapabilities() {
+      return await remoteShellCapabilities(ws)
+    },
+    async lineCount(path, opts = {}) {
+      const result = await rpc(
+        ws,
+        'exec',
+        {
+          command: lineCountCommand(path, remoteFlavorOf(ws.root)),
+          cwd: ws.root,
+          timeoutMs: 20_000,
+        },
+        { timeoutMs: 25_000, signal: opts.signal },
+      )
+      if (result.exitCode !== 0) return { reason: 'error' }
+      return parseLineCount(result.stdout)
     },
   }
 }
@@ -206,13 +297,21 @@ async function remoteCode(ws, call) {
       return { content: [{ type: 'text', text: 'path required' }], isError: true }
     }
     const language = String(call.args?.language ?? '').toLowerCase()
-    command =
+    const typescript =
       language === 'ts' ||
       language === 'typescript' ||
       path.endsWith('.ts') ||
       path.endsWith('.tsx')
+    if (remoteFlavorOf(ws.root) === 'windows') {
+      const literal = psQuote(toForwardSlashes(path))
+      command = typescript
+        ? `npx --yes tsc --noEmit --pretty false ${literal} 2>&1 | Select-Object -First 40`
+        : `node --check ${literal}`
+    } else {
+      command = typescript
         ? `npx --yes tsc --noEmit --pretty false ${JSON.stringify(path)} 2>&1 | head -n 40`
         : `node --check ${JSON.stringify(path)}`
+    }
   }
   const result = await primitives.exec(command, { cwd: ws.root, timeoutMs: 60_000 })
   if (result.exitCode === 0) {

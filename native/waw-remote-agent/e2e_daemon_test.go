@@ -174,6 +174,8 @@ func findDaemonBinary(t *testing.T) string {
 	root := repoRoot()
 	cands := []string{
 		filepath.Join(root, "native/waw-remote-agent/dist/waw-remote-agent"),
+		// build.ps1 keeps the Windows extension; the file name is the only split.
+		filepath.Join(root, "native/waw-remote-agent/dist/waw-remote-agent.exe"),
 	}
 	for _, c := range cands {
 		if _, err := os.Stat(c); err == nil {

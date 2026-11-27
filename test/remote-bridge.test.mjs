@@ -1,106 +1,75 @@
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
-  extrasDirs,
-  hostTargetPlatform,
-  isAbsoluteWorkspacePath,
+  POSIX_PROTOCOL_VERSION,
+  REQUIRED_PROTOCOL_VERSION,
+  binaryNamesFor,
   multiplexArgs,
-  normalizeRemoteArch,
-  normalizeRemoteOs,
   resolveControlMasterDir,
-  resolveLocalBinary,
 } from '../remote-bridge.mjs'
 
-test('normalizes OS and architecture identifiers across macOS, Linux, and Windows', () => {
-  assert.equal(normalizeRemoteOs('Darwin'), 'darwin')
-  assert.equal(normalizeRemoteOs('darwin'), 'darwin')
-  assert.equal(normalizeRemoteOs('Linux'), 'linux')
-  assert.equal(normalizeRemoteOs('win32'), 'windows')
-  assert.equal(normalizeRemoteOs('MINGW64_NT-10.0'), 'windows')
+/**
+ * Which local build gets uploaded for a remote target, plus the two SSH details
+ * that differ per platform. A name that forgets the arch uploads a binary the
+ * host cannot execute; a wrong control socket breaks every ssh call on macOS.
+ */
+const local = { osName: 'linux', arch: 'amd64' }
 
-  assert.equal(normalizeRemoteArch('arm64'), 'arm64')
-  assert.equal(normalizeRemoteArch('aarch64'), 'arm64')
-  assert.equal(normalizeRemoteArch('x86_64'), 'amd64')
-  assert.equal(normalizeRemoteArch('x64'), 'amd64')
-
-  assert.deepEqual(hostTargetPlatform('darwin', 'arm64'), { os: 'darwin', arch: 'arm64' })
-  assert.deepEqual(hostTargetPlatform('darwin', 'x64'), { os: 'darwin', arch: 'amd64' })
-  assert.deepEqual(hostTargetPlatform('win32', 'x64'), { os: 'windows', arch: 'amd64' })
-  assert.deepEqual(hostTargetPlatform('linux', 'arm64'), { os: 'linux', arch: 'arm64' })
-})
-
-test('extrasDirs includes macOS Application Support and Windows AppData locations', () => {
-  const macDirs = extrasDirs('darwin', {}, '/Users/alice')
-  assert.ok(macDirs.includes('/Users/alice/Library/Application Support/waw/extras'))
-  assert.ok(macDirs.includes('/Users/alice/.local/share/waw/extras'))
-
-  const winDirs = extrasDirs(
-    'win32',
-    { LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local', APPDATA: 'C:\\Users\\alice\\AppData\\Roaming' },
-    'C:\\Users\\alice',
-  )
-  assert.ok(winDirs.some((d) => d.includes('AppData\\Local') && d.endsWith(join('waw', 'extras'))))
-  assert.ok(winDirs.some((d) => d.includes('AppData\\Roaming') && d.endsWith(join('waw', 'extras'))))
-})
-
-test('resolveControlMasterDir and multiplexArgs handle macOS socket path cap and Windows', () => {
-  const shortMac = resolveControlMasterDir('darwin', '/Users/al')
-  assert.equal(shortMac, '/Users/al/.waw/ssh-cm')
-
-  const longMac = resolveControlMasterDir('darwin', '/Users/very-long-macos-username-example-account')
-  assert.match(longMac, /^\/tmp\/waw-cm-/)
-
-  const winArgs = multiplexArgs('win32', 'C:\\Users\\alice')
-  assert.deepEqual(winArgs, ['-o', 'ConnectTimeout=15'])
-
-  const macArgs = multiplexArgs('darwin', '/Users/al')
-  assert.ok(macArgs.includes('ControlMaster=auto'))
-  assert.ok(macArgs.some((a) => a.startsWith('ControlPath=')))
-})
-
-test('resolveLocalBinary prefers target-qualified binary for cross-platform SSH and falls back to generic', () => {
-  const repoRoot = '/repo'
-  const files = new Set([
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-darwin-arm64',
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-linux-amd64',
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-windows-amd64.exe',
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent',
+test('names the build for the probed target, never another arch', () => {
+  assert.deepEqual(binaryNamesFor('windows', { arch: 'amd64' }, local), [
+    'waw-remote-agent-windows-amd64.exe',
+    'waw-remote-agent.exe',
   ])
-  const baseOpts = {
-    env: {},
-    platform: 'darwin',
-    arch: 'arm64',
-    home: '/Users/alice',
-    cwd: '/other',
-    here: repoRoot,
-    exists: (p) => files.has(p),
-  }
-
-  assert.equal(
-    resolveLocalBinary({ os: 'darwin', arch: 'arm64' }, baseOpts),
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-darwin-arm64',
-  )
-  assert.equal(
-    resolveLocalBinary({ os: 'linux', arch: 'amd64' }, baseOpts),
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-linux-amd64',
-  )
-  assert.equal(
-    resolveLocalBinary({ os: 'windows', arch: 'amd64' }, baseOpts),
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent-windows-amd64.exe',
-  )
-  // Fallback to generic binary when exact target-qualified binary is absent
-  assert.equal(
-    resolveLocalBinary({ os: 'darwin', arch: 'amd64' }, baseOpts),
-    '/repo/native/waw-remote-agent/dist/waw-remote-agent',
-  )
+  // PROCESSOR_ARCHITECTURE spellings are normalised, not passed through, and the
+  // legacy unversioned exe is only ever offered to this desktop's own target.
+  assert.deepEqual(binaryNamesFor('windows', { arch: 'ARM64' }, local), [
+    'waw-remote-agent-windows-arm64.exe',
+  ])
+  assert.deepEqual(binaryNamesFor('posix', { osName: 'darwin', arch: 'arm64' }, local), [
+    'waw-remote-agent-darwin-arm64',
+  ])
+  // A probe that said nothing falls back to this desktop's own target.
+  assert.deepEqual(binaryNamesFor('posix', {}, local), [
+    'waw-remote-agent-linux-amd64',
+    'waw-remote-agent',
+  ])
 })
 
-test('isAbsoluteWorkspacePath accepts POSIX/macOS and Windows drive paths', () => {
-  assert.equal(isAbsoluteWorkspacePath('/Users/alice/project'), true)
-  assert.equal(isAbsoluteWorkspacePath('/data/ws'), true)
-  assert.equal(isAbsoluteWorkspacePath('C:\\Users\\alice\\project'), true)
-  assert.equal(isAbsoluteWorkspacePath('D:/work/repo'), true)
-  assert.equal(isAbsoluteWorkspacePath('relative/path'), false)
-  assert.equal(isAbsoluteWorkspacePath(''), false)
+test('pins the protocol versions the mirror ships', () => {
+  // A mirror that silently drifts to an older protocol installs a binary the
+  // app refuses to use. Bump these together with native/waw-remote-agent.
+  assert.equal(REQUIRED_PROTOCOL_VERSION, 6)
+  assert.equal(POSIX_PROTOCOL_VERSION, 5)
+})
+
+test('moves the macOS control socket to /tmp only when the path cannot fit', () => {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const longHome = '/Users/avery.very.long.account.name.here'
+  // macOS caps sockaddr_un.sun_path at 104 bytes; ~/.waw/ssh-cm/<40-char hash>
+  // plus OpenSSH's own suffix overflows it, and every ssh call fails.
+  assert.equal(resolveControlMasterDir('darwin', longHome), `/tmp/waw-cm-${uid}`)
+  // A short home still fits, and Linux is not capped at all.
+  assert.equal(resolveControlMasterDir('darwin', '/home/u'), join('/home/u', '.waw', 'ssh-cm'))
+  assert.equal(resolveControlMasterDir('linux', longHome), join(longHome, '.waw', 'ssh-cm'))
+})
+
+test('asks Windows OpenSSH for no control socket, and points ControlPath at the resolved dir', () => {
+  assert.deepEqual(multiplexArgs('win32', 'C:\\Users\\alice'), ['-o', 'ConnectTimeout=15'])
+  // A real temp home, so the assertion also covers the directory ssh needs to
+  // exist before the first connection (a hardcoded /home/u would mkdir a path
+  // outside the test on Windows and prove nothing).
+  const home = mkdtempSync(join(tmpdir(), 'waw-cm-'))
+  try {
+    const dir = resolveControlMasterDir('linux', home)
+    const args = multiplexArgs('linux', home)
+    assert.ok(args.includes('ControlMaster=auto'))
+    assert.ok(args.includes(`ControlPath=${dir}/%C`))
+    assert.ok(args.includes('ControlPersist=120'))
+    assert.ok(existsSync(dir), `control socket directory was not created: ${dir}`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })

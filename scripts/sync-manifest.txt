@@ -1,12 +1,18 @@
-# plugin <desktop/agent-desktop/src/plugins 下的文件名>
+# 上游文件清单：<plugin|native> <相对路径>
+#
+# plugin：waw 的 desktop/agent-desktop/src/plugins 下的文件名，落到本仓库根目录。
+# native：waw 的 native/ 下的相对路径，落到本仓库 native/ 下的同名位置。
+#
+# 只列「运行期与构建需要」的文件：插件的 .ts 测试在上游用 vitest 跑，本仓库的
+# test/ 是自己的 node --test 套件（不随上游同步），所以不列 .test.ts。
 plugin remote-agent.plugin.mjs
 plugin remote-bridge.mjs
 plugin remote-exec.mjs
+plugin remote-os.mjs
 plugin remote-rpc.mjs
 plugin remote-status.mjs
-plugin remote-rpc.test.ts
-plugin remote-status.test.ts
-# native <native/ 下的相对路径>
+# Go 端：源码、测试（go test 直接跑）与两端构建脚本
+native waw-remote-agent/README.md
 native waw-remote-agent/go.mod
 native waw-remote-agent/go.sum
 native waw-remote-agent/main.go
@@ -16,16 +22,20 @@ native waw-remote-agent/protocol.go
 native waw-remote-agent/http_transport.go
 native waw-remote-agent/proc_unix.go
 native waw-remote-agent/proc_windows.go
+native waw-remote-agent/shell.go
 native waw-remote-agent/stray_linux.go
 native waw-remote-agent/stray_darwin.go
 native waw-remote-agent/stray_other.go
 native waw-remote-agent/stray_ps.go
 native waw-remote-agent/stray_ps_test.go
+native waw-remote-agent/stray_windows.go
+native waw-remote-agent/stray_windows_test.go
 native waw-remote-agent/protocol_test.go
 native waw-remote-agent/daemon_test.go
 native waw-remote-agent/jobs_test.go
 native waw-remote-agent/http_transport_test.go
 native waw-remote-agent/main_test.go
+native waw-remote-agent/shell_test.go
 native waw-remote-agent/e2e_daemon_test.go
 native waw-remote-agent/build.sh
 native waw-remote-agent/build.ps1

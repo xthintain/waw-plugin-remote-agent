@@ -4,7 +4,6 @@ package main
 
 import (
 	"errors"
-	"os"
 	"os/exec"
 	"syscall"
 )
@@ -31,13 +30,6 @@ func killProcessTree(cmd *exec.Cmd) {
 	}
 }
 
-func terminateProcess(p *os.Process) {
-	if p == nil {
-		return
-	}
-	_ = p.Signal(syscall.SIGTERM)
-}
-
 func exitCodeOf(err error) int {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
@@ -45,3 +37,19 @@ func exitCodeOf(err error) int {
 	}
 	return -1
 }
+
+/** A graceful stop: the daemon's worker gets SIGTERM, then its own kill backstop. */
+func terminateProcess(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+/** `exec.CommandContext` already kills the direct child on Unix; keep that. */
+func armCancel(_ *exec.Cmd) {}
+
+/** Job Objects are Windows-only; POSIX relies on process groups and /proc. */
+func attachWorkerToJob(int) {}

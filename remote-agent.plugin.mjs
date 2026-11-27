@@ -201,7 +201,12 @@ export default async function remoteAgent(api) {
   // ── Kernel half (tui-host) ────────────────────────────────────────────────
   if (caps.tools) {
     const bridgeHref = new URL('./remote-bridge.mjs', import.meta.url).href
-    const { getAgentModeStatus, switchAgentMode } = await import(/* @vite-ignore */ bridgeHref)
+    const loggerHref = new URL('./remote-logger.mjs', import.meta.url).href
+    const [{ getAgentModeStatus, switchAgentMode }, { clearLogs, getLogFilePath, getLogLevel, readLogs }] =
+      await Promise.all([
+        import(/* @vite-ignore */ bridgeHref),
+        import(/* @vite-ignore */ loggerHref),
+      ])
     api.tools.register(
       {
         name: 'remote::ping',
@@ -255,6 +260,46 @@ export default async function remoteAgent(api) {
           ok: true,
           ...result,
           isolatedFrom: result.mode === 'local' ? 'remote' : 'local',
+        })
+      },
+    )
+    api.tools.register(
+      {
+        name: 'remote::logs',
+        description:
+          'Inspect, filter, locate, or clear structured JSONL logs for remote/local agent execution.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['tail', 'path', 'clear'] },
+            limit: { type: 'number' },
+            level: { type: 'string', enum: ['debug', 'info', 'warn', 'error'] },
+            component: { type: 'string' },
+            search: { type: 'string' },
+          },
+        },
+      },
+      (args) => {
+        const action = String(args?.action ?? 'tail').trim()
+        if (action === 'path') {
+          return JSON.stringify({ ok: true, filePath: getLogFilePath(), level: getLogLevel() })
+        }
+        if (action === 'clear') {
+          clearLogs()
+          return JSON.stringify({ ok: true, cleared: true, filePath: getLogFilePath() })
+        }
+        const entries = readLogs({
+          limit: args?.limit,
+          level: args?.level,
+          component: args?.component,
+          search: args?.search,
+        })
+        return JSON.stringify({
+          ok: true,
+          filePath: getLogFilePath(),
+          level: getLogLevel(),
+          count: entries.length,
+          entries,
         })
       },
     )

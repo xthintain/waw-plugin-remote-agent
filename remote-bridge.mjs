@@ -23,6 +23,7 @@ import {
   setAgentModeRaw,
   subscribeAgentMode,
 } from './remote-mode.mjs'
+import { logNativeStderr, logger } from './remote-logger.mjs'
 import { RemoteRpcClient } from './remote-rpc.mjs'
 import {
   listRemoteAgentHealth,
@@ -95,6 +96,7 @@ export async function switchAgentMode(nextMode) {
     probeInflight.clear()
     await disconnectAllRemoteAgents()
     setAgentModeRaw(normalized)
+    logger.info('mode', 'mode.switch', { previousMode, mode: normalized, disconnected })
     return { previousMode, mode: normalized, switched: true, disconnected }
   }
   const job = modeSwitchInflight.then(runSwitch, runSwitch)
@@ -572,7 +574,17 @@ export async function ensureRemoteAgent(target, opts = {}) {
   const workspace = String(target.root || '').replace(/\/+$/, '') || '/'
   if (!sshHost) throw new Error('sshHost required')
   if (!isAbsoluteWorkspacePath(workspace)) throw new Error('remote workspace must be absolute')
-  assertModeAllowsTarget(sshHost)
+  try {
+    assertModeAllowsTarget(sshHost)
+  } catch (err) {
+    logger.warn('mode', 'mode.blocked', {
+      mode: getAgentMode(),
+      sshHost,
+      workspace,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    throw err
+  }
 
   const key = poolKey(sshHost, workspace)
   const healthTarget = { sshHost, root: workspace }
@@ -589,6 +601,13 @@ export async function ensureRemoteAgent(target, opts = {}) {
 
   try {
     const token = randomBytes(24).toString('hex')
+    const startedAt = Date.now()
+    logger.info('bridge', 'agent.spawn', {
+      mode: getAgentMode(),
+      sshHost,
+      workspace,
+      forceInstall: Boolean(opts.forceInstall),
+    })
     const child = await spawnAgent(sshHost, workspace, token, {
       forceInstall: Boolean(opts.forceInstall),
     })
@@ -607,6 +626,14 @@ export async function ensureRemoteAgent(target, opts = {}) {
       } catch {
         /* */
       }
+      logger.info('bridge', 'agent.exit', {
+        mode: getAgentMode(),
+        sshHost,
+        workspace,
+        code,
+        signal,
+        unexpected,
+      })
       if (unexpected) {
         recordRemoteAgentHealth(
           healthTarget,
@@ -615,8 +642,8 @@ export async function ensureRemoteAgent(target, opts = {}) {
         )
       }
     })
-    child.stderr?.on('data', () => {
-      /* keep pipe drained; errors surface on ping/call */
+    child.stderr?.on('data', (chunk) => {
+      logNativeStderr(chunk, { sshHost, workspace, mode: getAgentMode() })
     })
 
     const ping = await rpc.call('ping', {}, { timeoutMs: 20_000 })
@@ -630,9 +657,24 @@ export async function ensureRemoteAgent(target, opts = {}) {
       hostCache.delete(sshHost)
       return await ensureRemoteAgent(target, { forceInstall: true })
     }
+    logger.info('bridge', 'agent.ready', {
+      mode: getAgentMode(),
+      sshHost,
+      workspace,
+      os: ping.result?.os,
+      arch: ping.result?.arch,
+      protocolVersion: ver,
+      durationMs: Date.now() - startedAt,
+    })
     recordRemoteAgentHealth(healthTarget, 'ok')
     return conn
   } catch (err) {
+    logger.error('bridge', 'agent.error', {
+      mode: getAgentMode(),
+      sshHost,
+      workspace,
+      error: err instanceof Error ? err.message : String(err),
+    })
     recordRemoteAgentHealth(healthTarget, 'error', err instanceof Error ? err.message : String(err))
     throw err
   }

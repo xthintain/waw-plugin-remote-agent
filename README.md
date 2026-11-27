@@ -20,6 +20,7 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 | `remote-bridge.mjs` | 起 / 池化 `waw-remote-agent`，SSH 只用来探测目标平台、投递并启动远端二进制 |
 | `remote-exec.mjs` | 远端 / 本地 shell / fs / code::map 的转发层 |
 | `remote-mode.mjs` | `remote` 与 `local` 模式的严格互斥隔离状态机 |
+| `remote-logger.mjs` | 全链路结构化 JSONL 日志系统（自动轮转、敏感信息脱敏、Go stderr 聚合与查询） |
 | `remote-rpc.mjs` | 与远端二进制的 JSON-RPC 客户端 |
 | `remote-status.mjs` | 健康表（侧栏与重连用），被 `remote-rpc.test.ts` / `remote-status.test.ts` 覆盖 |
 | `native/waw-remote-agent/` | 远端 Go agent 源码（协议版本 5：daemon 生命周期 + 后台 job，支持 Linux / macOS / Windows） |
@@ -31,6 +32,15 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 
 * **严格互斥隔离**：两种模式不能同时使用。处于 `remote` 模式时禁止调用 `local` 目标；处于 `local` 模式时禁止调用任何远端 SSH 目标。
 * **切换自动清理**：调用 `remote::mode`（`{"action": "switch", "mode": "local"}` 或 `"remote"`）或 `switchAgentMode()` 切换状态时，会先断开并回收旧模式的全部活跃连接，再激活目标模式。
+
+
+## 全链路日志系统（Full Log System）
+
+Node 侧与 Go 原生 agent 侧统一输出结构化 JSONL 日志（默认写入 `~/.waw/logs/remote-agent.log`，支持 5 MiB 自动轮转与 `.1`/`.2` 备份）：
+
+* **环境变量**：`WAW_REMOTE_AGENT_LOG_LEVEL`（`debug|info|warn|error`，默认 `info`）、`WAW_REMOTE_AGENT_LOG_FILE`（自定义路径，设为 `off` 关闭写盘）。
+* **自动脱敏**：所有 `token`、`passphrase`、`password`、`Authorization` 及 GitHub PAT 自动替换为 `[REDACTED]`。
+* **查询工具**：`remote::logs` 支持 `action: "tail" | "path" | "clear"` 及按 `level` / `component` / `search` 过滤。
 
 ## 平台支持与构建
 

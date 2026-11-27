@@ -228,6 +228,14 @@ func (a *agent) serveWS(conn *websocket.Conn) error {
 }
 
 func (a *agent) handle(req request) {
+	started := time.Now()
+	defer func() {
+		logDebugEvent("rpc", "rpc.handled", map[string]interface{}{
+			"id":         req.ID,
+			"method":     req.Method,
+			"durationMs": time.Since(started).Milliseconds(),
+		})
+	}()
 	switch req.Method {
 	case "ping":
 		host, _ := os.Hostname()

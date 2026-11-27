@@ -9,8 +9,10 @@
  */
 import { existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
+import { logger } from './remote-logger.mjs'
 import {
   assertModeAllowsTarget,
+  getAgentMode,
   disconnectAllRemoteAgents,
   ensureRemoteTool,
   isAbsoluteWorkspacePath,
@@ -66,8 +68,9 @@ export function resolveRemoteCwd(wsRoot, cwd) {
 }
 
 async function rpc(ws, method, params, opts = {}) {
+  const startedAt = Date.now()
   try {
-    return await withRemoteAgent(ws, async (conn) => {
+    const result = await withRemoteAgent(ws, async (conn) => {
       const resp = await conn.rpc.call(method, params, {
         timeoutMs: opts.timeoutMs ?? 30_000,
         ...(opts.signal ? { signal: opts.signal } : {}),
@@ -75,8 +78,23 @@ async function rpc(ws, method, params, opts = {}) {
       if (!resp.ok) throw new Error(resp.error ?? `${method} failed`)
       return resp.result ?? {}
     })
+    logger.info('exec', 'rpc.ok', {
+      mode: getAgentMode(),
+      sshHost: ws.sshHost,
+      method,
+      durationMs: Date.now() - startedAt,
+    })
+    return result
   } catch (err) {
-    throw new Error(sanitizeRemoteError(err instanceof Error ? err.message : String(err)))
+    const sanitized = sanitizeRemoteError(err instanceof Error ? err.message : String(err))
+    logger.error('exec', 'rpc.error', {
+      mode: getAgentMode(),
+      sshHost: ws.sshHost,
+      method,
+      durationMs: Date.now() - startedAt,
+      error: sanitized,
+    })
+    throw new Error(sanitized)
   }
 }
 

@@ -3,6 +3,7 @@ plugin remote-agent.plugin.mjs
 plugin remote-bridge.mjs
 plugin remote-exec.mjs
 plugin remote-mode.mjs
+plugin remote-logger.mjs
 plugin remote-rpc.mjs
 plugin remote-status.mjs
 plugin remote-rpc.test.ts
@@ -11,6 +12,7 @@ plugin remote-status.test.ts
 native waw-remote-agent/go.mod
 native waw-remote-agent/go.sum
 native waw-remote-agent/main.go
+native waw-remote-agent/logger.go
 native waw-remote-agent/daemon.go
 native waw-remote-agent/jobs.go
 native waw-remote-agent/protocol.go

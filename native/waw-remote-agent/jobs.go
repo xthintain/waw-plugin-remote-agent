@@ -200,9 +200,22 @@ func (a *agent) handleJobStart(req request) {
 			j.state = jobStateFailed
 			j.exitCode = exitCodeOf(waitErr)
 		}
+		finalState := j.state
+		finalCode := j.exitCode
 		j.mu.Unlock()
+		logInfoEvent("jobs", "job.exit", map[string]interface{}{
+			"jobId":    j.id,
+			"pid":      j.pid,
+			"state":    finalState,
+			"exitCode": finalCode,
+		})
 	}()
 
+	logInfoEvent("jobs", "job.start", map[string]interface{}{
+		"jobId": id,
+		"pid":   j.pid,
+		"cwd":   cwd,
+	})
 	_ = a.writeResponse(response{ID: req.ID, OK: true, Result: map[string]interface{}{
 		"jobId":     id,
 		"pid":       j.pid,
@@ -298,6 +311,10 @@ func (a *agent) handleJobKill(req request) {
 	j.state = jobStateKilled
 	j.mu.Unlock()
 	killProcessTree(j.cmd)
+	logInfoEvent("jobs", "job.kill", map[string]interface{}{
+		"jobId": p.JobID,
+		"pid":   j.pid,
+	})
 	_ = a.writeResponse(response{ID: req.ID, OK: true, Result: map[string]interface{}{
 		"jobId": p.JobID,
 		"state": jobStateKilled,

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -24,7 +25,10 @@ func main() {
 		30*time.Minute,
 		"daemon: stop all workers after this long without a control-plane connection (daemon stays)",
 	)
+	logLevel := flag.String("log-level", "", "log level: debug|info|warn|error (env WAW_REMOTE_AGENT_LOG_LEVEL)")
+	logFile := flag.String("log-file", "", "optional JSONL log file path (env WAW_REMOTE_AGENT_LOG_FILE)")
 	flag.Parse()
+	configureAgentLogger(*logLevel, *logFile)
 
 	if strings.TrimSpace(*workspace) == "" || strings.TrimSpace(*token) == "" {
 		fmt.Fprintln(os.Stderr, "usage: waw-remote-agent --workspace <abs> --token <tok> [--dial-ws URL | --dial-http URL] [--agent-id ID] [--daemon]")
@@ -41,6 +45,25 @@ func main() {
 		host, _ := os.Hostname()
 		id = host
 	}
+
+	runMode := "stdio"
+	switch {
+	case *daemon:
+		runMode = "daemon"
+	case *daemonWorker:
+		runMode = "daemon-worker"
+	case strings.TrimSpace(*dialHTTP) != "":
+		runMode = "http"
+	case strings.TrimSpace(*dialWS) != "":
+		runMode = "ws"
+	}
+	logInfoEvent("agent", "agent.start", map[string]interface{}{
+		"mode":      runMode,
+		"os":        runtime.GOOS,
+		"arch":      runtime.GOARCH,
+		"workspace": ws,
+		"agentId":   id,
+	})
 
 	switch {
 	case *daemon:

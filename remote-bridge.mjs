@@ -266,9 +266,10 @@ export function binaryNamesFor(os = 'posix', info = {}, local = localTarget) {
   const names = []
   if (os === 'windows') {
     names.push(`waw-remote-agent-windows-${arch}.exe`)
-    // A Windows desktop's own unversioned build is amd64; never hand it to an
-    // arm64 host.
-    if (arch === 'amd64') names.push('waw-remote-agent.exe')
+    // The unversioned .exe is this desktop's own (host-target) build — both
+    // build scripts copy the host target there — so it may only stand in for
+    // the same os/arch, never for a differently-arched remote.
+    if (local.osName === 'windows' && arch === local.arch) names.push('waw-remote-agent.exe')
   } else {
     names.push(`waw-remote-agent-${osName}-${arch}`)
     if (osName === local.osName && arch === local.arch) names.push('waw-remote-agent')

@@ -17,7 +17,7 @@
   "upstream": {
     "repo": "waw",
     "path": "desktop/agent-desktop/src/plugins + native/waw-remote-agent",
-    "commit": "d53372bd"
+    "commit": "ada8389f"
   },
   "license": "MIT"
 }

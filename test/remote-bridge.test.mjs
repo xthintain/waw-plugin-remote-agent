@@ -19,12 +19,21 @@ import {
 const local = { osName: 'linux', arch: 'amd64' }
 
 test('names the build for the probed target, never another arch', () => {
+  // The unversioned .exe is the host-target build, so a POSIX desktop (the
+  // default `local` below) has nothing to offer under that name.
   assert.deepEqual(binaryNamesFor('windows', { arch: 'amd64' }, local), [
+    'waw-remote-agent-windows-amd64.exe',
+  ])
+  // A windows/amd64 desktop's own build is that same unversioned exe...
+  assert.deepEqual(binaryNamesFor('windows', { arch: 'amd64' }, { osName: 'windows', arch: 'amd64' }), [
     'waw-remote-agent-windows-amd64.exe',
     'waw-remote-agent.exe',
   ])
-  // PROCESSOR_ARCHITECTURE spellings are normalised, not passed through, and the
-  // legacy unversioned exe is only ever offered to this desktop's own target.
+  // ...while a Windows-on-ARM one is arm64 and must not stand in for amd64.
+  assert.deepEqual(binaryNamesFor('windows', { arch: 'amd64' }, { osName: 'windows', arch: 'arm64' }), [
+    'waw-remote-agent-windows-amd64.exe',
+  ])
+  // PROCESSOR_ARCHITECTURE spellings are normalised, not passed through.
   assert.deepEqual(binaryNamesFor('windows', { arch: 'ARM64' }, local), [
     'waw-remote-agent-windows-arm64.exe',
   ])

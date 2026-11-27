@@ -28,10 +28,13 @@ HTTP 是 `register → poll → reply`，响应由后台 goroutine 提交，处�
 ./build.sh   # 本机目标（自动识别 linux/darwin/windows × amd64/arm64）+ linux/amd64 + windows/amd64 + windows/arm64
 ./build.sh --all                            # linux / darwin / windows × amd64 / arm64
 WAW_REMOTE_TARGETS=linux/amd64 ./build.sh   # 只多产指定的那份（本机目标始终补入）
-pwsh -File build.ps1                        # Windows 本机构建
+
+# Windows（与上面一一对应；-All 是 --all）
+pwsh -File build.ps1                        # 本机目标 + 默认远端矩阵
+pwsh -File build.ps1 -All                   # 六目标
 ```
 
-`dist/waw-remote-agent[.exe]`（不带 os/arch）永远是**本机目标**的产物：宿主默认路径、e2e 与 smoke 都按这个名字取本地 pipe 用的二进制。
+`dist/waw-remote-agent[.exe]`（不带 os/arch）永远是**本机目标**的产物：宿主默认路径、e2e 与 smoke 都按这个名字取本地 pipe 用的二进制。`$env:GOOS` / `$env:GOARCH` 在两个脚本里都**不参与选目标**，要交叉构建请用 `WAW_REMOTE_TARGETS`（或 `--all` / `-All`）；Windows PowerShell 5.1 也能跑 `build.ps1`（脚本自己区分 5.1 与 7，不依赖 `$IsWindows`）。
 
 ## 两种运行模式
 

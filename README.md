@@ -45,7 +45,7 @@ capabilities.tools|modules|servers  capabilities.ui|extras
 WAW_REMOTE_TARGETS=darwin/arm64,linux/amd64 ./native/waw-remote-agent/build.sh
 ```
 
-`dist/waw-remote-agent[.exe]`（不带 os/arch）永远是**本机目标**的产物 —— 本机 spawn 用它；远端上传走 `waw-remote-agent-<os>-<arch>[.exe]`。Windows 侧用 `pwsh -File native/waw-remote-agent/build.ps1`（只产 `windows/amd64`；arm64 宿主先 `$env:GOARCH='arm64'`，`--all` 与 `WAW_REMOTE_TARGETS` 目前只在 `build.sh` 里）。
+`dist/waw-remote-agent[.exe]`（不带 os/arch）永远是**本机目标**的产物 —— 本机 spawn 用它；远端上传走 `waw-remote-agent-<os>-<arch>[.exe]`。Windows 侧用 `pwsh -File native/waw-remote-agent/build.ps1`，与 `build.sh` 一一对应：`-All`（= `--all`）、`$env:WAW_REMOTE_TARGETS`、宿主架构自探测（Windows on ARM 也产 arm64），Windows PowerShell 5.1 也能跑。`$env:GOOS` / `$env:GOARCH` 在两个脚本里都不参与选目标。
 
 ## 安装
 

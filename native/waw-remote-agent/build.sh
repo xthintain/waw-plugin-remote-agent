@@ -42,7 +42,14 @@ if [[ "${1:-}" == "--all" ]]; then
   targets=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64)
 else
   : "${WAW_REMOTE_TARGETS:=linux/amd64,windows/amd64,windows/arm64}"
-  IFS=',' read -r -a targets <<< "$WAW_REMOTE_TARGETS"
+  # 与 build.ps1 一致：去掉每项两端的空白、丢掉空段（`a, b` / `,a` 不该一边成功一边失败）。
+  IFS=',' read -r -a raw_targets <<< "$WAW_REMOTE_TARGETS"
+  targets=()
+  for raw in "${raw_targets[@]}"; do
+    trimmed="${raw#"${raw%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" ]] && targets+=("$trimmed")
+  done
 fi
 
 # 本机目标必须产出：宿主与 extras 安装都从 dist/waw-remote-agent[.exe] 取本机用的那份。
@@ -51,6 +58,10 @@ if [[ " ${targets[*]} " != *" $host_target "* ]]; then
 fi
 
 for target in "${targets[@]}"; do
+  if [[ "$target" != */* ]]; then
+    echo "bad target: $target (expect <os>/<arch>)" >&2
+    exit 2
+  fi
   goos="${target%%/*}"
   goarch="${target##*/}"
   out="dist/waw-remote-agent-${goos}-${goarch}"
